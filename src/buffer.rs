@@ -62,6 +62,16 @@ pub fn expand_tabs_for_display(s: &str) -> String {
     out
 }
 
+const MAX_UNDO_HISTORY: usize = 200;
+
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    lines: Vec<String>,
+    cursor_line: usize,
+    cursor_col: usize,
+    dirty: bool,
+}
+
 pub struct TextBuffer {
     pub lines: Vec<String>,
     /// 0-indexed current line
@@ -76,6 +86,8 @@ pub struct TextBuffer {
     pub revision: u64,
     pub encoding: &'static str,
     pub line_ending: &'static str,
+    undo_stack: Vec<UndoSnapshot>,
+    redo_stack: Vec<UndoSnapshot>,
 }
 
 impl Default for TextBuffer {
@@ -96,6 +108,8 @@ impl TextBuffer {
             revision: 0,
             encoding: "UTF-8",
             line_ending: "\n",
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -117,6 +131,8 @@ impl TextBuffer {
             revision: 1,
             encoding: "UTF-8",
             line_ending,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         })
     }
 
@@ -125,6 +141,13 @@ impl TextBuffer {
         fs::write(path, content)?;
         self.file_path = Some(path.to_path_buf());
         self.dirty = false;
+        // Mark previous undo snapshots as dirty since they differ from the newly saved file
+        for snap in &mut self.undo_stack {
+            snap.dirty = true;
+        }
+        for snap in &mut self.redo_stack {
+            snap.dirty = true;
+        }
         Ok(())
     }
 
@@ -344,12 +367,68 @@ impl TextBuffer {
         self.cursor_col = self.char_col_for_visual_col(self.cursor_line, target_vcol);
     }
 
+    // --- Undo / Redo ---
+
+    fn current_snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot {
+            lines: self.lines.clone(),
+            cursor_line: self.cursor_line,
+            cursor_col: self.cursor_col,
+            dirty: self.dirty,
+        }
+    }
+
+    fn push_undo_snapshot(&mut self) {
+        if self.undo_stack.len() >= MAX_UNDO_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(self.current_snapshot());
+        self.redo_stack.clear();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.redo_stack.push(self.current_snapshot());
+        self.lines = prev.lines;
+        self.cursor_line = prev.cursor_line;
+        self.cursor_col = prev.cursor_col;
+        self.dirty = prev.dirty;
+        self.preferred_visual_col = None;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack.push(self.current_snapshot());
+        self.lines = next.lines;
+        self.cursor_line = next.cursor_line;
+        self.cursor_col = next.cursor_col;
+        self.dirty = next.dirty;
+        self.preferred_visual_col = None;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
     // --- Editing Operations ---
 
     pub fn insert_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
+        self.push_undo_snapshot();
         self.preferred_visual_col = None;
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let mut parts = normalized.split('\n');
@@ -373,6 +452,7 @@ impl TextBuffer {
     }
 
     pub fn insert_newline(&mut self) {
+        self.push_undo_snapshot();
         self.preferred_visual_col = None;
         self.insert_newline_internal();
         self.dirty = true;
@@ -391,6 +471,7 @@ impl TextBuffer {
     pub fn backspace(&mut self) {
         self.preferred_visual_col = None;
         if self.cursor_col > 0 {
+            self.push_undo_snapshot();
             let line = &mut self.lines[self.cursor_line];
             let start = char_to_byte_idx(line, self.cursor_col - 1);
             let end = char_to_byte_idx(line, self.cursor_col);
@@ -399,6 +480,7 @@ impl TextBuffer {
             self.dirty = true;
             self.revision = self.revision.wrapping_add(1);
         } else if self.cursor_line > 0 {
+            self.push_undo_snapshot();
             let current = self.lines.remove(self.cursor_line);
             self.cursor_line -= 1;
             let prev_len = self.line_char_len(self.cursor_line);
@@ -414,6 +496,7 @@ impl TextBuffer {
         self.preferred_visual_col = None;
         let len = self.line_char_len(self.cursor_line);
         if self.cursor_col < len {
+            self.push_undo_snapshot();
             let line = &mut self.lines[self.cursor_line];
             let start = char_to_byte_idx(line, self.cursor_col);
             let end = char_to_byte_idx(line, self.cursor_col + 1);
@@ -421,6 +504,7 @@ impl TextBuffer {
             self.dirty = true;
             self.revision = self.revision.wrapping_add(1);
         } else if self.cursor_line + 1 < self.lines.len() {
+            self.push_undo_snapshot();
             let next = self.lines.remove(self.cursor_line + 1);
             self.lines[self.cursor_line].push_str(&next);
             self.dirty = true;
@@ -433,6 +517,7 @@ impl TextBuffer {
         self.preferred_visual_col = None;
         if self.lines.len() == 1 {
             if !self.lines[0].is_empty() {
+                self.push_undo_snapshot();
                 self.lines[0].clear();
                 self.cursor_col = 0;
                 self.dirty = true;
@@ -441,6 +526,7 @@ impl TextBuffer {
             return;
         }
 
+        self.push_undo_snapshot();
         self.lines.remove(self.cursor_line);
         if self.cursor_line >= self.lines.len() {
             self.cursor_line = self.lines.len() - 1;
@@ -526,5 +612,37 @@ mod tests {
         assert!(rev1 > 0);
         buf.insert_newline();
         assert!(buf.revision > rev1);
+    }
+
+    #[test]
+    fn test_undo_redo() {
+        let mut buf = TextBuffer::new();
+        assert!(!buf.can_undo());
+        assert!(!buf.can_redo());
+
+        buf.insert_text("hello");
+        assert!(buf.dirty);
+        assert!(buf.can_undo());
+        buf.insert_text(" world");
+        assert_eq!(buf.lines, vec!["hello world"]);
+
+        assert!(buf.undo());
+        assert_eq!(buf.lines, vec!["hello"]);
+        assert!(buf.dirty);
+        assert!(buf.can_redo());
+
+        assert!(buf.undo());
+        assert_eq!(buf.lines, vec![""]);
+        assert!(!buf.dirty);
+        assert!(!buf.can_undo());
+
+        assert!(buf.redo());
+        assert_eq!(buf.lines, vec!["hello"]);
+        assert!(buf.dirty);
+
+        // New edit clears redo history
+        buf.insert_text("!");
+        assert!(!buf.can_redo());
+        assert_eq!(buf.lines, vec!["hello!"]);
     }
 }

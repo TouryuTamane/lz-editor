@@ -111,6 +111,95 @@ enum FilerAction {
     Quit,
 }
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_REPO_URL: &str = "https://github.com/TouryuTamane/lz-editor";
+
+const MENU_BAR_BG: Color32 = Color32::from_rgb(7, 21, 50);
+const MENU_BAR_HOVER: Color32 = Color32::from_rgb(20, 56, 114);
+const MENU_POPUP_BG: Color32 = Color32::from_rgb(10, 30, 70);
+const MENU_ITEM_HOVER: Color32 = Color32::from_rgb(26, 74, 146);
+const MENU_TEXT_DISABLED: Color32 = Color32::from_rgb(74, 108, 152);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopMenu {
+    File,
+    Edit,
+    Tools,
+    About,
+}
+
+impl TopMenu {
+    const ALL: [TopMenu; 4] = [TopMenu::File, TopMenu::Edit, TopMenu::Tools, TopMenu::About];
+
+    fn label(self) -> &'static str {
+        match self {
+            TopMenu::File => "ファイル",
+            TopMenu::Edit => "編集",
+            TopMenu::Tools => "ツール",
+            TopMenu::About => "About",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            TopMenu::File => TopMenu::Edit,
+            TopMenu::Edit => TopMenu::Tools,
+            TopMenu::Tools => TopMenu::About,
+            TopMenu::About => TopMenu::File,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            TopMenu::File => TopMenu::About,
+            TopMenu::Edit => TopMenu::File,
+            TopMenu::Tools => TopMenu::Edit,
+            TopMenu::About => TopMenu::Tools,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    // File
+    NewBuffer,
+    OpenFile,
+    SaveFile,
+    SaveAs,
+    CloseBuffer,
+    ToggleFiler,
+    Quit,
+    // Edit
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    DeleteLine,
+    MoveLineStart,
+    MoveLineEnd,
+    // Tools
+    ToggleMarkdownView,
+    FontZoomIn,
+    FontZoomOut,
+    FontReset,
+    NextBuffer,
+    // About
+    ShowHelp,
+    ShowAbout,
+}
+
+#[derive(Debug, Clone)]
+enum MenuEntry {
+    Item {
+        label: &'static str,
+        shortcut: &'static str,
+        action: MenuAction,
+        enabled: bool,
+    },
+    Separator,
+}
+
 #[derive(Debug, Clone)]
 struct InlinePathPrompt {
     is_save: bool,
@@ -142,6 +231,10 @@ enum FilerModal {
     },
     ConfirmDelete {
         targets: Vec<FileEntry>,
+    },
+    ConfirmCloseBuffer {
+        buf_idx: usize,
+        name: String,
     },
     ConfirmQuit,
 }
@@ -200,6 +293,8 @@ pub struct LzEditorApp {
     status_message: String,
     ime_preedit: String,
     ime_active: bool,
+    last_window_title: String,
+    internal_clipboard: String,
 
     // Rendering / scrolling state
     font_size: f32,
@@ -208,8 +303,11 @@ pub struct LzEditorApp {
     last_visible_lines: usize,
     last_filer_visible_rows: usize,
 
-    // UI overlays & async native dialogs
+    // Menu bar & UI overlays / async native dialogs
+    open_menu: Option<TopMenu>,
+    menu_selected_idx: usize,
     show_help: bool,
+    show_about: bool,
     pending_dialog: Option<Receiver<DialogResult>>,
     inline_prompt: Option<InlinePathPrompt>,
     filer_modal: Option<FilerModal>,
@@ -256,7 +354,7 @@ impl LzEditorApp {
             TextBuffer::new()
         };
 
-        Self {
+        let mut app = Self {
             mode: AppMode::Editor,
             buffers: vec![BufferSlot::new(initial_buffer)],
             active_buf: 0,
@@ -265,16 +363,23 @@ impl LzEditorApp {
             status_message,
             ime_preedit: String::new(),
             ime_active: false,
+            last_window_title: String::new(),
+            internal_clipboard: String::new(),
             font_size: DEFAULT_FONT_SIZE,
             line_height: calc_line_height(DEFAULT_FONT_SIZE),
             need_scroll_to_cursor: false,
             last_visible_lines: 24,
             last_filer_visible_rows: 20,
+            open_menu: None,
+            menu_selected_idx: 0,
             show_help: false,
+            show_about: false,
             pending_dialog: None,
             inline_prompt: None,
             filer_modal: None,
-        }
+        };
+        app.sync_window_title(&cc.egui_ctx);
+        app
     }
 
     fn configure_visuals(ctx: &egui::Context) {
@@ -620,6 +725,30 @@ impl LzEditorApp {
         }
     }
 
+    // --- Dynamic Window Title ---
+
+    fn compute_window_title(&self) -> String {
+        match self.mode {
+            AppMode::Editor => {
+                let buf = self.cur_buf();
+                let dirty_prefix = if buf.dirty { "*" } else { "" };
+                format!("{}{} - LZ Editor", dirty_prefix, buf.display_name())
+            }
+            AppMode::Filer => {
+                let dir = self.filer.active_pane().current_dir.display();
+                format!("[2画面ファイラー] {} - LZ Editor", dir)
+            }
+        }
+    }
+
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let title = self.compute_window_title();
+        if title != self.last_window_title {
+            self.last_window_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+    }
+
     fn perform_save(&mut self, path: PathBuf) {
         match self.cur_buf_mut().save_to_path(&path) {
             Ok(()) => {
@@ -640,6 +769,14 @@ impl LzEditorApp {
         }
     }
 
+    fn trigger_save_as(&mut self) {
+        if self.pending_dialog.is_none() {
+            self.status_message = "名前を付けて保存先を選択中...".to_string();
+            let current = self.cur_buf().file_path.clone();
+            self.pending_dialog = Some(spawn_save_dialog(current.as_deref()));
+        }
+    }
+
     fn trigger_open(&mut self) {
         if self.pending_dialog.is_none() {
             self.status_message = "開くファイルを選択中...".to_string();
@@ -650,6 +787,446 @@ impl LzEditorApp {
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf());
             self.pending_dialog = Some(spawn_open_dialog(dir.as_deref()));
+        }
+    }
+
+    fn close_current_buffer(&mut self) {
+        let idx = self.active_buf;
+        if self.buffers[idx].buffer.dirty {
+            let name = self.buffers[idx].buffer.display_name();
+            self.filer_modal = Some(FilerModal::ConfirmCloseBuffer { buf_idx: idx, name });
+        } else {
+            self.force_close_buffer(idx);
+        }
+    }
+
+    fn force_close_buffer(&mut self, idx: usize) {
+        if idx >= self.buffers.len() {
+            return;
+        }
+        let closed_name = self.buffers[idx].buffer.display_name();
+        self.prefix = PrefixKey::None;
+        self.ime_preedit.clear();
+        if self.buffers.len() <= 1 {
+            self.buffers[0] = BufferSlot::new(TextBuffer::new());
+            self.active_buf = 0;
+            self.need_scroll_to_cursor = true;
+            self.status_message = format!("バッファを閉じました ({closed_name}) -> 新規 [無題]");
+        } else {
+            self.buffers.remove(idx);
+            if self.active_buf >= self.buffers.len() {
+                self.active_buf = self.buffers.len() - 1;
+            }
+            self.need_scroll_to_cursor = true;
+            if self.cur_slot().markdown_view {
+                self.cur_slot_mut().md_scroll_dirty = true;
+            }
+            let next_name = self.cur_buf().display_name();
+            self.status_message = format!(
+                "バッファを閉じました ({closed_name}) -> [{}/{}] {next_name}",
+                self.active_buf + 1,
+                self.buffers.len()
+            );
+        }
+    }
+
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.has_any_dirty_buffer() {
+            self.filer_modal = Some(FilerModal::ConfirmQuit);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    // --- Clipboard & Edit Menu Helpers ---
+
+    fn menu_undo(&mut self) {
+        if self.is_markdown_view() || self.mode != AppMode::Editor {
+            return;
+        }
+        if self.cur_buf_mut().undo() {
+            self.need_scroll_to_cursor = true;
+            self.status_message = "元に戻しました (Undo)".to_string();
+        } else {
+            self.status_message = "元に戻せる履歴がありません".to_string();
+        }
+    }
+
+    fn menu_redo(&mut self) {
+        if self.is_markdown_view() || self.mode != AppMode::Editor {
+            return;
+        }
+        if self.cur_buf_mut().redo() {
+            self.need_scroll_to_cursor = true;
+            self.status_message = "やり直しました (Redo)".to_string();
+        } else {
+            self.status_message = "やり直せる履歴がありません".to_string();
+        }
+    }
+
+    fn menu_copy(&mut self, ctx: &egui::Context) {
+        if self.mode != AppMode::Editor {
+            return;
+        }
+        let text = if self.is_markdown_view() {
+            self.cur_buf().lines.join(self.cur_buf().line_ending)
+        } else {
+            self.cur_buf().current_line_str().to_string()
+        };
+        self.internal_clipboard = text.clone();
+        ctx.copy_text(text);
+        self.status_message = if self.is_markdown_view() {
+            "ドキュメント全体をクリップボードへコピーしました".to_string()
+        } else {
+            "現在行をクリップボードへコピーしました".to_string()
+        };
+    }
+
+    fn menu_cut(&mut self, ctx: &egui::Context) {
+        if self.mode != AppMode::Editor || self.is_markdown_view() {
+            return;
+        }
+        let line = self.cur_buf().current_line_str().to_string();
+        self.internal_clipboard = line.clone();
+        ctx.copy_text(line);
+        self.cur_buf_mut().delete_current_line();
+        self.need_scroll_to_cursor = true;
+        self.status_message = "現在行を切り取りました".to_string();
+    }
+
+    fn menu_paste(&mut self) {
+        if self.mode != AppMode::Editor || self.is_markdown_view() {
+            return;
+        }
+        let pasted = read_system_clipboard().or_else(|| {
+            if self.internal_clipboard.is_empty() {
+                None
+            } else {
+                Some(self.internal_clipboard.clone())
+            }
+        });
+        match pasted {
+            Some(text) if !text.is_empty() => {
+                self.cur_buf_mut().insert_text(&text);
+                self.need_scroll_to_cursor = true;
+                self.status_message = "クリップボードから貼り付けました".to_string();
+            }
+            _ => {
+                self.status_message =
+                    "クリップボードが空です（Ctrl+V での貼り付けも利用できます）".to_string();
+            }
+        }
+    }
+
+    // --- Menu Bar Model & Actions ---
+
+    fn build_menu_entries(&self, menu: TopMenu) -> Vec<MenuEntry> {
+        let in_editor = self.mode == AppMode::Editor;
+        let in_md_view = self.is_markdown_view();
+        let can_edit = in_editor && !in_md_view;
+
+        match menu {
+            TopMenu::File => vec![
+                MenuEntry::Item {
+                    label: "新規作成",
+                    shortcut: "F2",
+                    action: MenuAction::NewBuffer,
+                    enabled: true,
+                },
+                MenuEntry::Item {
+                    label: "ファイルを開く...",
+                    shortcut: "F3",
+                    action: MenuAction::OpenFile,
+                    enabled: true,
+                },
+                MenuEntry::Item {
+                    label: "上書き保存",
+                    shortcut: "^K^D / F10",
+                    action: MenuAction::SaveFile,
+                    enabled: true,
+                },
+                MenuEntry::Item {
+                    label: "名前を付けて保存...",
+                    shortcut: "",
+                    action: MenuAction::SaveAs,
+                    enabled: true,
+                },
+                MenuEntry::Item {
+                    label: "現在のバッファを閉じる",
+                    shortcut: "",
+                    action: MenuAction::CloseBuffer,
+                    enabled: true,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: if in_editor {
+                        "2画面ファイラーへ切替"
+                    } else {
+                        "エディタ画面へ戻る"
+                    },
+                    shortcut: "ESC / F9",
+                    action: MenuAction::ToggleFiler,
+                    enabled: true,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "終了",
+                    shortcut: "^K^Q",
+                    action: MenuAction::Quit,
+                    enabled: true,
+                },
+            ],
+            TopMenu::Edit => vec![
+                MenuEntry::Item {
+                    label: "元に戻す (Undo)",
+                    shortcut: "",
+                    action: MenuAction::Undo,
+                    enabled: can_edit && self.cur_buf().can_undo(),
+                },
+                MenuEntry::Item {
+                    label: "やり直し (Redo)",
+                    shortcut: "",
+                    action: MenuAction::Redo,
+                    enabled: can_edit && self.cur_buf().can_redo(),
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "切り取り (現在行)",
+                    shortcut: "",
+                    action: MenuAction::Cut,
+                    enabled: can_edit,
+                },
+                MenuEntry::Item {
+                    label: if in_md_view {
+                        "コピー (全文)"
+                    } else {
+                        "コピー (現在行)"
+                    },
+                    shortcut: "",
+                    action: MenuAction::Copy,
+                    enabled: in_editor,
+                },
+                MenuEntry::Item {
+                    label: "貼り付け",
+                    shortcut: "Ctrl+V",
+                    action: MenuAction::Paste,
+                    enabled: can_edit,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "現在行の削除",
+                    shortcut: "Ctrl+Y",
+                    action: MenuAction::DeleteLine,
+                    enabled: can_edit,
+                },
+                MenuEntry::Item {
+                    label: if in_md_view {
+                        "ドキュメント先頭へ"
+                    } else {
+                        "行頭へ移動"
+                    },
+                    shortcut: "^Q^S / F4",
+                    action: MenuAction::MoveLineStart,
+                    enabled: in_editor,
+                },
+                MenuEntry::Item {
+                    label: if in_md_view {
+                        "ドキュメント末尾へ"
+                    } else {
+                        "行末へ移動"
+                    },
+                    shortcut: "^Q^D / F5",
+                    action: MenuAction::MoveLineEnd,
+                    enabled: in_editor,
+                },
+            ],
+            TopMenu::Tools => vec![
+                MenuEntry::Item {
+                    label: if in_md_view {
+                        "テキスト編集モードへ戻す"
+                    } else {
+                        "Markdown ビューモードへ切替"
+                    },
+                    shortcut: "Ctrl+P",
+                    action: MenuAction::ToggleMarkdownView,
+                    enabled: in_editor,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "フォントサイズ拡大",
+                    shortcut: "Ctrl++",
+                    action: MenuAction::FontZoomIn,
+                    enabled: self.font_size < MAX_FONT_SIZE,
+                },
+                MenuEntry::Item {
+                    label: "フォントサイズ縮小",
+                    shortcut: "Ctrl+-",
+                    action: MenuAction::FontZoomOut,
+                    enabled: self.font_size > MIN_FONT_SIZE,
+                },
+                MenuEntry::Item {
+                    label: "フォントサイズリセット (16pt)",
+                    shortcut: "Ctrl+0",
+                    action: MenuAction::FontReset,
+                    enabled: true,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "次のバッファへ切替",
+                    shortcut: "Ctrl+W",
+                    action: MenuAction::NextBuffer,
+                    enabled: self.buffers.len() > 1,
+                },
+            ],
+            TopMenu::About => vec![
+                MenuEntry::Item {
+                    label: "キーバインド・操作ヘルプ",
+                    shortcut: "F1",
+                    action: MenuAction::ShowHelp,
+                    enabled: true,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "バージョン情報...",
+                    shortcut: "",
+                    action: MenuAction::ShowAbout,
+                    enabled: true,
+                },
+            ],
+        }
+    }
+
+    fn first_selectable_menu_idx(entries: &[MenuEntry]) -> usize {
+        entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Item { enabled: true, .. }))
+            .or_else(|| entries.iter().position(|e| matches!(e, MenuEntry::Item { .. })))
+            .unwrap_or(0)
+    }
+
+    fn step_menu_selection(&mut self, entries: &[MenuEntry], delta: isize) {
+        let len = entries.len();
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.menu_selected_idx.min(len - 1);
+        for _ in 0..len {
+            idx = ((idx as isize + delta).rem_euclid(len as isize)) as usize;
+            if matches!(entries[idx], MenuEntry::Item { .. }) {
+                self.menu_selected_idx = idx;
+                return;
+            }
+        }
+    }
+
+    fn open_top_menu(&mut self, menu: TopMenu) {
+        self.prefix = PrefixKey::None;
+        let entries = self.build_menu_entries(menu);
+        self.menu_selected_idx = Self::first_selectable_menu_idx(&entries);
+        self.open_menu = Some(menu);
+    }
+
+    fn execute_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
+        self.open_menu = None;
+        self.prefix = PrefixKey::None;
+        match action {
+            MenuAction::NewBuffer => self.new_empty_buffer(),
+            MenuAction::OpenFile => self.trigger_open(),
+            MenuAction::SaveFile => self.trigger_save(),
+            MenuAction::SaveAs => self.trigger_save_as(),
+            MenuAction::CloseBuffer => self.close_current_buffer(),
+            MenuAction::ToggleFiler => match self.mode {
+                AppMode::Editor => self.enter_filer(),
+                AppMode::Filer => self.enter_editor(),
+            },
+            MenuAction::Quit => self.request_quit(ctx),
+            MenuAction::Undo => self.menu_undo(),
+            MenuAction::Redo => self.menu_redo(),
+            MenuAction::Cut => self.menu_cut(ctx),
+            MenuAction::Copy => self.menu_copy(ctx),
+            MenuAction::Paste => self.menu_paste(),
+            MenuAction::DeleteLine => self.execute_editor_action(EditorAction::DeleteLine),
+            MenuAction::MoveLineStart => self.execute_editor_action(EditorAction::MoveLineStart),
+            MenuAction::MoveLineEnd => self.execute_editor_action(EditorAction::MoveLineEnd),
+            MenuAction::ToggleMarkdownView => {
+                if self.mode == AppMode::Editor {
+                    self.toggle_markdown_view();
+                }
+            }
+            MenuAction::FontZoomIn => self.zoom_in_font(),
+            MenuAction::FontZoomOut => self.zoom_out_font(),
+            MenuAction::FontReset => self.reset_font_size(),
+            MenuAction::NextBuffer => {
+                if self.mode != AppMode::Editor {
+                    self.enter_editor();
+                }
+                self.switch_buffer_step(1);
+            }
+            MenuAction::ShowHelp => {
+                self.show_help = !self.show_help;
+            }
+            MenuAction::ShowAbout => {
+                self.show_help = false;
+                self.show_about = true;
+            }
+        }
+    }
+
+    fn handle_menu_events(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.open_menu else {
+            return;
+        };
+        let events = ctx.input(|i| i.events.clone());
+        let mut active_menu = menu;
+
+        for event in events {
+            if let Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                let ctrl = modifiers.ctrl || modifiers.command;
+                if ctrl || modifiers.alt {
+                    continue;
+                }
+                match key {
+                    Key::Escape => {
+                        self.open_menu = None;
+                        return;
+                    }
+                    Key::ArrowDown => {
+                        let entries = self.build_menu_entries(active_menu);
+                        self.step_menu_selection(&entries, 1);
+                    }
+                    Key::ArrowUp => {
+                        let entries = self.build_menu_entries(active_menu);
+                        self.step_menu_selection(&entries, -1);
+                    }
+                    Key::ArrowRight => {
+                        active_menu = active_menu.next();
+                        self.open_top_menu(active_menu);
+                    }
+                    Key::ArrowLeft => {
+                        active_menu = active_menu.prev();
+                        self.open_top_menu(active_menu);
+                    }
+                    Key::Enter => {
+                        let entries = self.build_menu_entries(active_menu);
+                        if let Some(MenuEntry::Item {
+                            action,
+                            enabled: true,
+                            ..
+                        }) = entries.get(self.menu_selected_idx)
+                        {
+                            self.execute_menu_action(ctx, *action);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -816,11 +1393,7 @@ impl LzEditorApp {
                 self.enter_editor();
             }
             FilerAction::Quit => {
-                if self.has_any_dirty_buffer() {
-                    self.filer_modal = Some(FilerModal::ConfirmQuit);
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                self.request_quit(ctx);
             }
         }
     }
@@ -828,7 +1401,11 @@ impl LzEditorApp {
     // --- Event Dispatch ---
 
     fn handle_events(&mut self, ctx: &egui::Context) {
-        if self.inline_prompt.is_some() || self.filer_modal.is_some() {
+        if self.inline_prompt.is_some() || self.filer_modal.is_some() || self.show_about {
+            return;
+        }
+        if self.open_menu.is_some() {
+            self.handle_menu_events(ctx);
             return;
         }
         match self.mode {
@@ -1432,6 +2009,232 @@ impl LzEditorApp {
                 }
 
                 _ => {}
+            }
+        }
+    }
+
+    // --- Compact VZ-Styled Top Menu Bar (VZ Keybinding Safe) ---
+
+    fn render_menu_bar(&mut self, ctx: &egui::Context) {
+        if self.open_menu.is_some() {
+            // Keep IME off while navigating an open menu so arrows / Enter / ESC stay crisp
+            ctx.output_mut(|o| {
+                o.ime = None;
+            });
+        }
+
+        let mut header_rects: [(TopMenu, Rect); 4] = [
+            (TopMenu::File, Rect::NOTHING),
+            (TopMenu::Edit, Rect::NOTHING),
+            (TopMenu::Tools, Rect::NOTHING),
+            (TopMenu::About, Rect::NOTHING),
+        ];
+        let mut bar_rect = Rect::NOTHING;
+        let mut clicked_header: Option<TopMenu> = None;
+        let mut hovered_header: Option<TopMenu> = None;
+
+        egui::TopBottomPanel::top("menu_bar")
+            .exact_height(24.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(MENU_BAR_BG)
+                    .inner_margin(egui::Margin::symmetric(6, 1))
+                    .stroke(Stroke::new(1.0_f32, GUTTER_SEP)),
+            )
+            .show(ctx, |ui| {
+                bar_rect = ui.max_rect();
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+
+                    for (slot_idx, &menu) in TopMenu::ALL.iter().enumerate() {
+                        let label = menu.label();
+                        let font = FontId::monospace(12.5);
+                        let text_w = ui.fonts(|f| {
+                            f.layout_no_wrap(label.to_string(), font.clone(), TEXT_WHITE)
+                                .size()
+                                .x
+                        });
+                        let btn_size = Vec2::new(text_w + 16.0, 20.0);
+                        // Non-focusable click region so keyboard focus is NEVER stolen from editor/filer
+                        let (rect, resp) = ui.allocate_exact_size(btn_size, Sense::click());
+                        header_rects[slot_idx] = (menu, rect);
+
+                        let is_open = self.open_menu == Some(menu);
+                        if resp.hovered() {
+                            hovered_header = Some(menu);
+                        }
+                        if resp.clicked() {
+                            clicked_header = Some(menu);
+                        }
+
+                        if ui.is_rect_visible(rect) {
+                            let painter = ui.painter();
+                            if is_open || resp.hovered() {
+                                let fill = if is_open {
+                                    MENU_ITEM_HOVER
+                                } else {
+                                    MENU_BAR_HOVER
+                                };
+                                painter.rect(
+                                    rect,
+                                    CornerRadius::same(2),
+                                    fill,
+                                    Stroke::new(
+                                        1.0_f32,
+                                        if is_open { TEXT_CYAN } else { BORDER_BLUE },
+                                    ),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                            painter.text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                label,
+                                font,
+                                if is_open { TEXT_CYAN } else { TEXT_WHITE },
+                            );
+                        }
+                    }
+                });
+            });
+
+        if let Some(menu) = clicked_header {
+            if self.open_menu == Some(menu) {
+                self.open_menu = None;
+            } else {
+                self.open_top_menu(menu);
+            }
+        } else if let (Some(open), Some(hovered)) = (self.open_menu, hovered_header) {
+            if open != hovered {
+                self.open_top_menu(hovered);
+            }
+        }
+
+        // Dropdown popup rendered on Foreground layer
+        let mut triggered_action: Option<MenuAction> = None;
+        let mut popup_rect = Rect::NOTHING;
+
+        if let Some(active_menu) = self.open_menu {
+            let anchor_rect = header_rects
+                .iter()
+                .find(|(m, _)| *m == active_menu)
+                .map(|(_, r)| *r)
+                .unwrap_or(bar_rect);
+            let entries = self.build_menu_entries(active_menu);
+            let popup_w = 276.0_f32;
+            let row_h = 24.0_f32;
+            let sep_h = 9.0_f32;
+            let selected_idx = self.menu_selected_idx;
+
+            let area_resp = egui::Area::new(egui::Id::new("lz_menu_popup"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(anchor_rect.min.x, bar_rect.max.y))
+                .show(ctx, |ui| {
+                    let frame_resp = egui::Frame::NONE
+                        .fill(MENU_POPUP_BG)
+                        .stroke(Stroke::new(1.5_f32, TEXT_CYAN))
+                        .corner_radius(CornerRadius::same(2))
+                        .inner_margin(egui::Margin::symmetric(4, 4))
+                        .show(ui, |ui| {
+                            ui.set_width(popup_w);
+                            ui.spacing_mut().item_spacing.y = 1.0;
+
+                            for (idx, entry) in entries.iter().enumerate() {
+                                match entry {
+                                    MenuEntry::Separator => {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(popup_w, sep_h),
+                                            Sense::hover(),
+                                        );
+                                        let y = rect.center().y;
+                                        ui.painter().line_segment(
+                                            [
+                                                Pos2::new(rect.min.x + 6.0, y),
+                                                Pos2::new(rect.max.x - 6.0, y),
+                                            ],
+                                            Stroke::new(1.0_f32, GUTTER_SEP),
+                                        );
+                                    }
+                                    MenuEntry::Item {
+                                        label,
+                                        shortcut,
+                                        action,
+                                        enabled,
+                                    } => {
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(popup_w, row_h),
+                                            Sense::click(),
+                                        );
+                                        if resp.hovered() {
+                                            self.menu_selected_idx = idx;
+                                        }
+                                        let is_selected = idx == selected_idx || resp.hovered();
+                                        if ui.is_rect_visible(rect) {
+                                            let p = ui.painter();
+                                            if is_selected && *enabled {
+                                                p.rect_filled(
+                                                    rect,
+                                                    CornerRadius::same(2),
+                                                    MENU_ITEM_HOVER,
+                                                );
+                                            }
+                                            let label_color = if !*enabled {
+                                                MENU_TEXT_DISABLED
+                                            } else if is_selected {
+                                                TEXT_WHITE
+                                            } else {
+                                                TEXT_WHITE
+                                            };
+                                            p.text(
+                                                Pos2::new(rect.min.x + 10.0, rect.center().y),
+                                                Align2::LEFT_CENTER,
+                                                *label,
+                                                FontId::monospace(12.5),
+                                                label_color,
+                                            );
+                                            if !shortcut.is_empty() {
+                                                let sc_color = if !*enabled {
+                                                    MENU_TEXT_DISABLED
+                                                } else if is_selected {
+                                                    TEXT_CYAN
+                                                } else {
+                                                    TEXT_DIM_CYAN
+                                                };
+                                                p.text(
+                                                    Pos2::new(rect.max.x - 10.0, rect.center().y),
+                                                    Align2::RIGHT_CENTER,
+                                                    *shortcut,
+                                                    FontId::monospace(11.5),
+                                                    sc_color,
+                                                );
+                                            }
+                                        }
+                                        if *enabled && resp.clicked() {
+                                            triggered_action = Some(*action);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    popup_rect = frame_resp.response.rect;
+                });
+            if popup_rect == Rect::NOTHING {
+                popup_rect = area_resp.response.rect;
+            }
+        }
+
+        if let Some(action) = triggered_action {
+            self.execute_menu_action(ctx, action);
+        } else if self.open_menu.is_some() && clicked_header.is_none() {
+            // Close menu if the user clicked anywhere outside both the menu bar and the popup
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|pos| {
+                        !bar_rect.contains(pos) && !popup_rect.contains(pos)
+                    })
+            });
+            if clicked_outside {
+                self.open_menu = None;
             }
         }
     }
@@ -2285,7 +3088,12 @@ impl LzEditorApp {
                 scroll_x = scroll_x.max(0.0);
 
                 // Click-to-place cursor
-                if response.clicked() {
+                if response.clicked()
+                    && self.open_menu.is_none()
+                    && !self.show_about
+                    && self.filer_modal.is_none()
+                    && self.inline_prompt.is_none()
+                {
                     if let Some(pointer_pos) = response.interact_pointer_pos() {
                         if editor_rect.contains(pointer_pos) {
                             let rel_y = pointer_pos.y - editor_rect.min.y - top_pad + scroll_y;
@@ -2506,7 +3314,11 @@ impl LzEditorApp {
                 }
 
                 // Report exact IME cursor area for Fcitx5 (tracks font_size & line_height accurately)
-                if self.inline_prompt.is_none() {
+                if self.inline_prompt.is_none()
+                    && self.filer_modal.is_none()
+                    && self.open_menu.is_none()
+                    && !self.show_about
+                {
                     let preedit_start_x =
                         editor_rect.min.x + left_pad + cursor_px_x - scroll_x;
                     let max_ime_x = (editor_rect.max.x - 4.0).max(editor_rect.min.x);
@@ -3054,6 +3866,126 @@ impl LzEditorApp {
         self.show_help = open;
     }
 
+    fn render_about_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        ctx.output_mut(|o| {
+            o.ime = None;
+        });
+
+        let mut open = self.show_about;
+        let mut close_clicked = false;
+
+        egui::Window::new("LZ Editor について (バージョン情報)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(STATUS_BG)
+                    .stroke(Stroke::new(1.5_f32, TEXT_CYAN))
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(430.0);
+
+                // Logo & version header
+                ui.horizontal(|ui| {
+                    egui::Frame::NONE
+                        .fill(STATUS_BADGE_BG)
+                        .corner_radius(CornerRadius::same(3))
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("LZ")
+                                    .font(FontId::monospace(22.0))
+                                    .strong()
+                                    .color(STATUS_BADGE_FG),
+                            );
+                        });
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("LZ Editor")
+                                .font(FontId::monospace(20.0))
+                                .strong()
+                                .color(TEXT_CYAN),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Version {APP_VERSION}"))
+                                .font(FontId::monospace(13.5))
+                                .strong()
+                                .color(TEXT_AMBER),
+                        );
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new(
+                        "Rust + egui 製の超軽量ネイティブ GUI VZ Editor クローン & 2画面ファイラー",
+                    )
+                    .font(FontId::monospace(13.0))
+                    .color(TEXT_WHITE),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "PC-98 / VZ 風デザイン・ダイヤモンドカーソル・ESC 2画面ファイラー・Fcitx5 IME・Markdown ビュー対応",
+                    )
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_DIM_CYAN),
+                );
+
+                ui.add_space(10.0);
+                egui::Grid::new("about_meta_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("License:")
+                                .font(FontId::monospace(12.5))
+                                .color(TEXT_DIM_CYAN),
+                        );
+                        ui.label(
+                            egui::RichText::new("MIT License © 2026 Touryu Tamane")
+                                .font(FontId::monospace(12.5))
+                                .color(TEXT_WHITE),
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            egui::RichText::new("GitHub:")
+                                .font(FontId::monospace(12.5))
+                                .color(TEXT_DIM_CYAN),
+                        );
+                        ui.hyperlink_to(
+                            egui::RichText::new(APP_REPO_URL)
+                                .font(FontId::monospace(12.5))
+                                .color(TEXT_CYAN),
+                            APP_REPO_URL,
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("閉じる (ESC / Enter)").clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter))
+                    {
+                        close_clicked = true;
+                    }
+                });
+            });
+
+        self.show_about = open && !close_clicked;
+    }
+
     fn render_filer_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.filer_modal.take() else {
             return;
@@ -3442,6 +4374,52 @@ impl LzEditorApp {
                 }
             }
 
+            FilerModal::ConfirmCloseBuffer { buf_idx, name } => {
+                let mut do_close = false;
+                let mut do_cancel = false;
+                let target_idx = *buf_idx;
+                egui::Window::new("バッファを閉じる確認")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .frame(
+                        egui::Frame::window(&ctx.style())
+                            .fill(STATUS_BG)
+                            .stroke(Stroke::new(1.5_f32, TEXT_AMBER)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.set_min_width(380.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "「{name}」には未保存の変更があります。保存せず閉じますか？"
+                            ))
+                            .font(FontId::monospace(13.5))
+                            .color(TEXT_AMBER),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("保存せず閉じる (Enter / Y)").clicked()
+                                || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Y))
+                            {
+                                do_close = true;
+                            }
+                            if ui.button("キャンセル (ESC / N)").clicked()
+                                || ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::N))
+                            {
+                                do_cancel = true;
+                            }
+                        });
+                    });
+
+                if do_close {
+                    keep_modal = false;
+                    self.force_close_buffer(target_idx);
+                } else if do_cancel {
+                    keep_modal = false;
+                    self.status_message = "バッファを閉じるのをキャンセルしました".to_string();
+                }
+            }
+
             FilerModal::ConfirmQuit => {
                 let mut do_quit = false;
                 let mut do_cancel = false;
@@ -3555,6 +4533,36 @@ impl LzEditorApp {
     }
 }
 
+/// Attempt to read UTF-8 text from the Linux system clipboard (Wayland `wl-paste`, X11 `xclip`/`xsel`).
+fn read_system_clipboard() -> Option<String> {
+    use std::process::Command;
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if let Ok(out) = Command::new("wl-paste").arg("--no-newline").output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    for (bin, args) in [
+        ("xclip", &["-o", "-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--output"][..]),
+    ] {
+        if let Ok(out) = Command::new(bin).args(args).output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn truncate_path_left(s: &str, max_cols: usize) -> String {
     use unicode_width::UnicodeWidthChar;
     let total_w: usize = s.chars().map(|c| c.width().unwrap_or(1)).sum();
@@ -3603,6 +4611,7 @@ impl eframe::App for LzEditorApp {
         self.poll_dialog();
         self.handle_events(ctx);
 
+        self.render_menu_bar(ctx);
         self.render_status_bar(ctx);
         self.render_buffer_strip(ctx);
         self.render_fkey_bar(ctx);
@@ -3619,8 +4628,12 @@ impl eframe::App for LzEditorApp {
         }
 
         self.render_help_overlay(ctx);
+        self.render_about_dialog(ctx);
         self.render_filer_modal(ctx);
         self.render_inline_path_prompt(ctx);
+
+        // Keep OS window title bar synchronized with current file, dirty state, or filer directory
+        self.sync_window_title(ctx);
 
         if self.pending_dialog.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -3645,12 +4658,17 @@ mod tests {
             status_message: String::new(),
             ime_preedit: String::new(),
             ime_active: false,
+            last_window_title: String::new(),
+            internal_clipboard: String::new(),
             font_size: DEFAULT_FONT_SIZE,
             line_height: calc_line_height(DEFAULT_FONT_SIZE),
             need_scroll_to_cursor: false,
             last_visible_lines: 24,
             last_filer_visible_rows: 20,
+            open_menu: None,
+            menu_selected_idx: 0,
             show_help: false,
+            show_about: false,
             pending_dialog: None,
             inline_prompt: None,
             filer_modal: None,
@@ -3736,6 +4754,128 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_window_title_formats() {
+        let mut app = make_test_app();
+        // Dirty named file
+        assert_eq!(app.compute_window_title(), "*notes.md - LZ Editor");
+
+        // Clean named file
+        app.cur_buf_mut().dirty = false;
+        assert_eq!(app.compute_window_title(), "notes.md - LZ Editor");
+
+        // Untitled new buffer
+        app.new_empty_buffer();
+        assert_eq!(app.compute_window_title(), "[無題] - LZ Editor");
+
+        // Dirty untitled buffer
+        app.cur_buf_mut().insert_text("draft");
+        assert_eq!(app.compute_window_title(), "*[無題] - LZ Editor");
+
+        // Buffer switch updates title immediately
+        app.switch_buffer_step(1);
+        assert_eq!(app.compute_window_title(), "notes.md - LZ Editor");
+
+        // 2-pane filer title reflects active pane directory
+        app.enter_filer();
+        let expected_dir = app.filer.active_pane().current_dir.display().to_string();
+        assert_eq!(
+            app.compute_window_title(),
+            format!("[2画面ファイラー] {expected_dir} - LZ Editor")
+        );
+    }
+
+    #[test]
+    fn test_menu_navigation_and_vz_keybinding_protection() {
+        let mut app = make_test_app();
+        let ctx = egui::Context::default();
+
+        // 1. When menu is closed, VZ Ctrl+E / Ctrl+X and ESC must work normally
+        app.cur_buf_mut().set_cursor(1, 0);
+        let raw_ctrl_e = egui::RawInput {
+            events: vec![Event::Key {
+                key: Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_ctrl_e, |ctx| app.handle_events(ctx));
+        assert_eq!(app.cur_buf().cursor_line, 0);
+
+        // 2. When menu is open, ESC closes the menu WITHOUT switching to Filer!
+        app.open_top_menu(TopMenu::File);
+        assert_eq!(app.open_menu, Some(TopMenu::File));
+        assert_eq!(app.mode, AppMode::Editor);
+
+        // ArrowRight moves to Edit menu
+        let raw_right = egui::RawInput {
+            events: vec![Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_right, |ctx| app.handle_events(ctx));
+        assert_eq!(app.open_menu, Some(TopMenu::Edit));
+
+        // ESC closes menu and stays in Editor mode
+        let raw_esc = egui::RawInput {
+            events: vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_esc, |ctx| app.handle_events(ctx));
+        assert_eq!(app.open_menu, None);
+        assert_eq!(app.mode, AppMode::Editor);
+
+        // 3. Now that menu is closed, ESC switches immediately to 2-pane Filer!
+        let raw_esc2 = egui::RawInput {
+            events: vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_esc2, |ctx| app.handle_events(ctx));
+        assert_eq!(app.mode, AppMode::Filer);
+    }
+
+    #[test]
+    fn test_close_buffer_clean_and_dirty() {
+        let mut app = make_test_app();
+        // Dirty buffer prompts for confirmation
+        app.close_current_buffer();
+        assert!(matches!(
+            app.filer_modal,
+            Some(FilerModal::ConfirmCloseBuffer { .. })
+        ));
+        app.filer_modal = None;
+
+        // Clean buffer closes immediately; last buffer resets to fresh [無題]
+        app.cur_buf_mut().dirty = false;
+        app.close_current_buffer();
+        assert_eq!(app.buffers.len(), 1);
+        assert_eq!(app.cur_buf().display_name(), "[無題]");
+        assert!(!app.cur_buf().dirty);
+    }
+
+    #[test]
     fn test_headless_render_all_modes_and_font_sizes() {
         let mut app = make_test_app();
         // Load real README.md content into the buffer
@@ -3754,16 +4894,23 @@ mod tests {
         for &size in &[MIN_FONT_SIZE, DEFAULT_FONT_SIZE, MAX_FONT_SIZE] {
             app.set_font_size(size);
 
-            // 1. Editor Edit Mode (including active IME preedit & IME rect output)
+            // 1. Editor Edit Mode (including menu bar, active IME preedit & IME rect output)
             app.mode = AppMode::Editor;
             app.cur_slot_mut().markdown_view = false;
+            app.open_menu = None;
+            app.show_about = false;
             let out_edit = ctx.run(raw_input.clone(), |ctx| {
+                app.render_menu_bar(ctx);
                 app.render_status_bar(ctx);
                 app.render_buffer_strip(ctx);
                 app.render_fkey_bar(ctx);
                 app.render_editor_canvas(ctx);
+                app.sync_window_title(ctx);
             });
-            let ime = out_edit.platform_output.ime.expect("IME output must be set in Edit mode");
+            let ime = out_edit
+                .platform_output
+                .ime
+                .expect("IME output must be set in Edit mode");
             assert!(
                 (ime.cursor_rect.height() - app.line_height).abs() < 0.01,
                 "IME cursor rect height must track line_height at {size}pt"
@@ -3773,10 +4920,12 @@ mod tests {
             app.cur_slot_mut().markdown_view = true;
             app.cur_slot_mut().md_scroll_dirty = true;
             let out_md = ctx.run(raw_input.clone(), |ctx| {
+                app.render_menu_bar(ctx);
                 app.render_status_bar(ctx);
                 app.render_buffer_strip(ctx);
                 app.render_fkey_bar(ctx);
                 app.render_markdown_canvas(ctx);
+                app.sync_window_title(ctx);
             });
             assert!(
                 out_md.platform_output.ime.is_none(),
@@ -3790,12 +4939,37 @@ mod tests {
             // 3. 2-Pane Filer Mode
             app.mode = AppMode::Filer;
             let out_filer = ctx.run(raw_input.clone(), |ctx| {
+                app.render_menu_bar(ctx);
                 app.render_status_bar(ctx);
                 app.render_fkey_bar(ctx);
                 app.render_filer_canvas(ctx);
+                app.sync_window_title(ctx);
             });
             assert!(out_filer.platform_output.ime.is_none());
         }
+
+        // 4. Open each TopMenu dropdown + About dialog headlessly
+        app.mode = AppMode::Editor;
+        app.cur_slot_mut().markdown_view = false;
+        for &menu in &TopMenu::ALL {
+            app.open_top_menu(menu);
+            let _ = ctx.run(raw_input.clone(), |ctx| {
+                app.render_menu_bar(ctx);
+                app.render_status_bar(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_editor_canvas(ctx);
+            });
+        }
+        app.open_menu = None;
+        app.show_about = true;
+        let _ = ctx.run(raw_input, |ctx| {
+            app.render_menu_bar(ctx);
+            app.render_status_bar(ctx);
+            app.render_fkey_bar(ctx);
+            app.render_editor_canvas(ctx);
+            app.render_about_dialog(ctx);
+        });
     }
 }
+
 

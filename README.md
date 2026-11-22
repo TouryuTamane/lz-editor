@@ -57,6 +57,8 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
   Zoom in/out/reset (`Ctrl++` / `Ctrl+-` / `Ctrl+0`, or click `[-] 16pt [+]` in the status bar) across both the editor and 2-pane filer, with automatic line height, cursor sizing, and Fcitx5 IME position tracking.
 - **Markdown Edit / View Mode Toggle / Markdown 編集・ビュー切替 (v0.2.0)**  
   Press `Ctrl+P`, `Ctrl+K+V`, `Alt+P`, or click `[EDIT]`/`[VIEW]` in the status bar to switch instantaneously between plain text editing and a VZ-navy-themed Markdown preview (headings, bold/italic/code, framed code blocks, lists/tasks, quotes, rules, links, and tables) while retaining keyboard scrolling, `ESC` filer switching, and `Ctrl+W` buffer switching.
+- **Compact GUI Menu Bar, Undo/Redo, Clipboard & Dynamic Title Bar / スリム GUI メニューバー・Undo/Redo・クリップボード・動的タイトル表示 (v0.2.0)**  
+  Slim VZ-navy top menu bar (`ファイル` / `編集` / `ツール` / `About`) designed never to steal focus from VZ keybindings, providing Save As, Close Buffer, Undo/Redo history, Cut/Copy/Paste clipboard integration, and an About dialog. The OS window title bar updates live with the current filename, dirty state (`*`), or active 2-pane filer directory.
 
 ---
 
@@ -169,9 +171,10 @@ cp target/release/lz ./lz
 
 ## Roadmap / ロードマップ
 
-- [x] **Phase 1**: Core VZ Editor GUI, Japanese font auto-loading, Fcitx5 inline IME, VZ diamond cursor & editing keybindings, Save/Open
-- [x] **Phase 2**: Instant `ESC` 2-pane VZ Filer (copy/move/delete/rename/mkdir/mark/sort) & `Ctrl+W` multi-buffer switching
-- [ ] **Phase 3 (Planned)**: Search & replace (`Ctrl+Q+F` / `Ctrl+Q+A`), Undo/Redo, Shift_JIS / EUC-JP encoding detection & conversion, customizable config file
+- [x] **Phase 1 (v0.1.0)**: Core VZ Editor GUI, Japanese font auto-loading, Fcitx5 inline IME, VZ diamond cursor & editing keybindings, Save/Open
+- [x] **Phase 2 (v0.1.1)**: Instant `ESC` 2-pane VZ Filer (copy/move/delete/rename/mkdir/mark/sort), `Ctrl+W` multi-buffer switching, `.deb` / `.rpm` packaging
+- [x] **v0.2.0**: Real-time font size scaling (`Ctrl++`/`-`/`0`), Markdown Edit/View mode (`Ctrl+P` / `Ctrl+K+V` / `Alt+P`), VZ-safe GUI menu bar, Undo/Redo, clipboard operations, dynamic OS window title bar
+- [ ] **Phase 3 (Planned)**: Search & replace (`Ctrl+Q+F` / `Ctrl+Q+A`), Shift_JIS / EUC-JP encoding detection & conversion, customizable config file
 
 ---
 
