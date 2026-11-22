@@ -1,0 +1,25 @@
+[package]
+name = "lz-editor"
+version = "0.1.0"
+edition = "2021"
+description = "LZ Editor - A lightweight native GUI VZ Editor clone for Linux written in Rust"
+license = "MIT"
+repository = "https://github.com/TouryuTamane/lz-editor"
+readme = "README.md"
+keywords = ["editor", "vz-editor", "egui", "filer", "linux"]
+categories = ["text-editors", "gui"]
+
+[[bin]]
+name = "lz"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
