@@ -11,4 +11,4 @@ Terminal=false
 Categories=Utility;TextEditor;
 MimeType=text/plain;text/markdown;text/x-csrc;text/x-chdr;text/x-rust;text/x-python;application/json;application/xml;application/x-shellscript;
 Keywords=editor;text;vz;filer;
-StartupWMClass=LZ Editor
+StartupWMClass=lz-editor
