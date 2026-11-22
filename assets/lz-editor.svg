@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0E2A5C"/>
+      <stop offset="100%" stop-color="#081838"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#70E8FF"/>
+      <stop offset="100%" stop-color="#2E8CD0"/>
+    </linearGradient>
+  </defs>
+  <!-- Window frame -->
+  <rect x="6" y="6" width="116" height="116" rx="16" ry="16" fill="url(#bg)" stroke="#40D2FF" stroke-width="4"/>
+  <!-- Top VZ status bar -->
+  <path d="M10 20 Q10 10 20 10 H108 Q118 10 118 20 V29 H10 Z" fill="#163E82"/>
+  <line x1="10" y1="29" x2="118" y2="29" stroke="#40D2FF" stroke-width="2"/>
+  <rect x="18" y="15" width="22" height="9" rx="2" fill="#40D2FF"/>
+  <rect x="82" y="17" width="28" height="5" rx="2" fill="#70E8FF" opacity="0.85"/>
+  <!-- Vector letter L -->
+  <path d="M22 44 H32 V74 H48 V83 H22 Z" fill="#EAF4FF"/>
+  <!-- Vector letter Z -->
+  <path d="M54 44 H84 V52 L65 74 H84 V83 H54 V75 L73 53 H54 Z" fill="#EAF4FF"/>
+  <!-- Glowing PC-98 cursor block -->
+  <rect x="92" y="44" width="16" height="39" rx="2" fill="url(#accent)"/>
+  <!-- Bottom F-key guide strip -->
+  <line x1="10" y1="98" x2="118" y2="98" stroke="#2A62A8" stroke-width="2"/>
+  <g fill="#2E8CD0">
+    <rect x="16" y="104" width="16" height="10" rx="2"/>
+    <rect x="36" y="104" width="16" height="10" rx="2"/>
+    <rect x="56" y="104" width="16" height="10" rx="2"/>
+    <rect x="76" y="104" width="16" height="10" rx="2"/>
+    <rect x="96" y="104" width="16" height="10" rx="2"/>
+  </g>
+</svg>

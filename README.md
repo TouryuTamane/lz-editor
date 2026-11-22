@@ -93,15 +93,54 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
 
 ---
 
+## Installation / インストール方法
+
+Prebuilt packages (`.deb`, `.rpm`) and standalone binaries for both `x86_64` and `aarch64` are available on the [GitHub Releases](https://github.com/TouryuTamane/lz-editor/releases) page.  
+`x86_64` / `aarch64` 向けのパッケージ（`.deb` / `.rpm`）および単一バイナリを [GitHub Releases](https://github.com/TouryuTamane/lz-editor/releases) からダウンロードできます。
+
+### Debian / Ubuntu / Raspberry Pi OS (`.deb`)
+
+Installing the `.deb` package places `lz` in `/usr/bin/lz` and registers the desktop launcher & icon automatically.  
+`.deb` パッケージをインストールすると `/usr/bin/lz` に配置され、アプリメニュー（デスクトップランチャー・アイコン）にも自動登録されます。
+
+```bash
+# x86_64 (amd64)
+sudo apt install ./lz-editor_*_amd64.deb
+
+# Raspberry Pi OS / ARM64 (arm64)
+sudo apt install ./lz-editor_*_arm64.deb
+```
+
+### Fedora / RHEL / Rocky Linux / AlmaLinux (`.rpm`)
+
+```bash
+# x86_64
+sudo dnf install ./lz-editor-*.x86_64.rpm
+
+# ARM64 (aarch64)
+sudo dnf install ./lz-editor-*.aarch64.rpm
+```
+
+### Standalone Binary / 単一バイナリ
+
+```bash
+# Example for x86_64 (use lz-linux-aarch64 on ARM64 / Raspberry Pi)
+chmod +x lz-linux-x86_64
+sudo mv lz-linux-x86_64 /usr/local/bin/lz
+lz
+```
+
+---
+
 ## Requirements & Build / 動作環境とビルド
 
 ### Requirements / 前提環境
 - Linux desktop environment (tested on **Raspberry Pi OS / Debian Trixie** & **Ubuntu GNOME**, Wayland / X11)
-- Rust toolchain (`rustc` / `cargo`, install via [rustup.rs](https://rustup.rs/))
+- Rust toolchain (`rustc` / `cargo`, install via [rustup.rs](https://rustup.rs/)) *(only needed when building from source)*
 - Japanese monospace font installed on the system (e.g., `fonts-noto-cjk`, `fonts-ipafont-gothic`, or `fonts-vlgothic`)
 - Optional: `zenity` or `kdialog` for native Save/Open dialogs (falls back to built-in inline path prompt if unavailable)
 
-### Build & Run / ビルドと実行
+### Build from Source / ソースからビルド
 
 ```bash
 git clone https://github.com/TouryuTamane/lz-editor.git

@@ -23,3 +23,33 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+
+[package.metadata.deb]
+maintainer = "Touryu Tamane <touryutamane@gmail.com>"
+copyright = "2026, Touryu Tamane"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+LZ Editor is a VZ Editor-inspired, ultra-lightweight native GUI text editor \
+and 2-pane filer for Linux written in Rust (eframe/egui). \
+Features classic PC-98 styling, diamond cursor navigation, instant ESC 2-pane \
+filer switching, multi-buffer support, and inline Fcitx5 Japanese IME."""
+depends = "$auto"
+recommends = "fonts-noto-cjk | fonts-ipafont-gothic | fonts-vlgothic, zenity"
+section = "editors"
+priority = "optional"
+assets = [
+    ["target/release/lz", "usr/bin/lz", "755"],
+    ["assets/lz-editor.desktop", "usr/share/applications/lz-editor.desktop", "644"],
+    ["assets/lz-editor.svg", "usr/share/icons/hicolor/scalable/apps/lz-editor.svg", "644"],
+    ["README.md", "usr/share/doc/lz-editor/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+auto-req = "builtin"
+assets = [
+    { source = "target/release/lz", dest = "/usr/bin/lz", mode = "0755" },
+    { source = "assets/lz-editor.desktop", dest = "/usr/share/applications/lz-editor.desktop", mode = "0644" },
+    { source = "assets/lz-editor.svg", dest = "/usr/share/icons/hicolor/scalable/apps/lz-editor.svg", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/lz-editor/README.md", mode = "0644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/lz-editor/LICENSE", mode = "0644", doc = true },
+]
