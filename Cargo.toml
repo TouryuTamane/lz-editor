@@ -1,6 +1,6 @@
 [package]
 name = "lz-editor"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "LZ Editor - A lightweight native GUI VZ Editor clone for Linux written in Rust"
 license = "MIT"

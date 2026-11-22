@@ -3,6 +3,7 @@ mod buffer;
 mod dialog;
 mod filer;
 mod fonts;
+mod markdown;
 
 use app::LzEditorApp;
 use eframe::egui;

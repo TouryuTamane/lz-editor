@@ -72,6 +72,8 @@ pub struct TextBuffer {
     preferred_visual_col: Option<usize>,
     pub file_path: Option<PathBuf>,
     pub dirty: bool,
+    /// Monotonically increasing revision incremented on every text mutation (for view caches)
+    pub revision: u64,
     pub encoding: &'static str,
     pub line_ending: &'static str,
 }
@@ -91,6 +93,7 @@ impl TextBuffer {
             preferred_visual_col: None,
             file_path: None,
             dirty: false,
+            revision: 0,
             encoding: "UTF-8",
             line_ending: "\n",
         }
@@ -111,6 +114,7 @@ impl TextBuffer {
             preferred_visual_col: None,
             file_path: Some(path.to_path_buf()),
             dirty: false,
+            revision: 1,
             encoding: "UTF-8",
             line_ending,
         })
@@ -130,6 +134,17 @@ impl TextBuffer {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "[無題]".to_string())
+    }
+
+    /// Returns true if the buffer's file path has a Markdown extension (`.md` or `.markdown`).
+    pub fn is_markdown(&self) -> bool {
+        self.file_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+            })
     }
 
     pub fn current_line_str(&self) -> &str {
@@ -354,12 +369,14 @@ impl TextBuffer {
             }
         }
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn insert_newline(&mut self) {
         self.preferred_visual_col = None;
         self.insert_newline_internal();
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn insert_newline_internal(&mut self) {
@@ -380,6 +397,7 @@ impl TextBuffer {
             line.replace_range(start..end, "");
             self.cursor_col -= 1;
             self.dirty = true;
+            self.revision = self.revision.wrapping_add(1);
         } else if self.cursor_line > 0 {
             let current = self.lines.remove(self.cursor_line);
             self.cursor_line -= 1;
@@ -387,6 +405,7 @@ impl TextBuffer {
             self.lines[self.cursor_line].push_str(&current);
             self.cursor_col = prev_len;
             self.dirty = true;
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -400,10 +419,12 @@ impl TextBuffer {
             let end = char_to_byte_idx(line, self.cursor_col + 1);
             line.replace_range(start..end, "");
             self.dirty = true;
+            self.revision = self.revision.wrapping_add(1);
         } else if self.cursor_line + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_line + 1);
             self.lines[self.cursor_line].push_str(&next);
             self.dirty = true;
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -415,6 +436,7 @@ impl TextBuffer {
                 self.lines[0].clear();
                 self.cursor_col = 0;
                 self.dirty = true;
+                self.revision = self.revision.wrapping_add(1);
             }
             return;
         }
@@ -426,6 +448,7 @@ impl TextBuffer {
         let max_col = self.line_char_len(self.cursor_line);
         self.cursor_col = self.cursor_col.min(max_col);
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 
@@ -481,5 +504,27 @@ mod tests {
         assert_eq!(buf.cursor_col, 9); // after です + space -> hello
         buf.move_word_left();
         assert_eq!(buf.cursor_col, 6); // back to です
+    }
+
+    #[test]
+    fn test_is_markdown_and_revision() {
+        let mut buf = TextBuffer::new();
+        assert!(!buf.is_markdown());
+        assert_eq!(buf.revision, 0);
+
+        buf.file_path = Some(PathBuf::from("README.md"));
+        assert!(buf.is_markdown());
+
+        buf.file_path = Some(PathBuf::from("/tmp/notes.MARKDOWN"));
+        assert!(buf.is_markdown());
+
+        buf.file_path = Some(PathBuf::from("main.rs"));
+        assert!(!buf.is_markdown());
+
+        buf.insert_text("# Title");
+        let rev1 = buf.revision;
+        assert!(rev1 > 0);
+        buf.insert_newline();
+        assert!(buf.revision > rev1);
     }
 }

@@ -5,6 +5,7 @@ use crate::filer::{
     ActivePane, FileEntry, FilerState,
 };
 use crate::fonts::configure_japanese_fonts;
+use crate::markdown::{parse_markdown, render_markdown_view, MdBlock};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Event, FontId, ImeEvent, Key, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
@@ -12,6 +13,16 @@ use eframe::egui::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
+
+// --- Font Size Scaling Constants ---
+const DEFAULT_FONT_SIZE: f32 = 16.0;
+const MIN_FONT_SIZE: f32 = 10.0;
+const MAX_FONT_SIZE: f32 = 36.0;
+const FONT_SIZE_STEP: f32 = 2.0;
+
+fn calc_line_height(font_size: f32) -> f32 {
+    (font_size * 1.45).round().max(font_size + 4.0)
+}
 
 // --- PC-98 / VZ Editor Color Palette ---
 const BG_NAVY: Color32 = Color32::from_rgb(8, 24, 56); // #081838
@@ -28,6 +39,7 @@ const GUTTER_SEP: Color32 = Color32::from_rgb(26, 62, 118);
 const STATUS_BG: Color32 = Color32::from_rgb(15, 42, 92);
 const STATUS_BADGE_BG: Color32 = Color32::from_rgb(64, 210, 255);
 const STATUS_BADGE_FILER_BG: Color32 = Color32::from_rgb(255, 206, 86);
+const STATUS_BADGE_VIEW_BG: Color32 = Color32::from_rgb(56, 204, 152);
 const STATUS_BADGE_FG: Color32 = Color32::from_rgb(6, 20, 48);
 
 const FKEY_BAR_BG: Color32 = Color32::from_rgb(10, 28, 64);
@@ -138,6 +150,13 @@ struct BufferSlot {
     buffer: TextBuffer,
     scroll_x: f32,
     scroll_y: f32,
+    markdown_view: bool,
+    md_scroll_y: f32,
+    md_max_scroll_y: f32,
+    md_viewport_h: f32,
+    md_scroll_dirty: bool,
+    md_cache_rev: Option<u64>,
+    md_blocks: Vec<MdBlock>,
 }
 
 impl BufferSlot {
@@ -146,6 +165,20 @@ impl BufferSlot {
             buffer,
             scroll_x: 0.0,
             scroll_y: 0.0,
+            markdown_view: false,
+            md_scroll_y: 0.0,
+            md_max_scroll_y: 0.0,
+            md_viewport_h: 400.0,
+            md_scroll_dirty: false,
+            md_cache_rev: None,
+            md_blocks: Vec::new(),
+        }
+    }
+
+    fn ensure_md_cache(&mut self) {
+        if self.md_cache_rev != Some(self.buffer.revision) {
+            self.md_blocks = parse_markdown(&self.buffer.lines);
+            self.md_cache_rev = Some(self.buffer.revision);
         }
     }
 
@@ -186,9 +219,14 @@ impl LzEditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
         configure_japanese_fonts(&cc.egui_ctx);
         Self::configure_visuals(&cc.egui_ctx);
+        // Disable egui's built-in Ctrl++/-/0 UI zoom so LZ Editor controls font scaling directly
+        // without double-scaling or breaking IME candidate window coordinates.
+        cc.egui_ctx.options_mut(|o| {
+            o.zoom_with_keyboard = false;
+        });
 
         let mut status_message =
-            String::from("VZ互換: ^E/^S/^D/^X移動  ^Wバッファ切替  ESCファイラー  F1ヘルプ");
+            String::from("VZ互換: ^E/^S/^D/^X移動  ^Wバッファ切替  ^P MDビュー  ESCファイラー  F1ヘルプ");
         let mut initial_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let initial_buffer = if let Some(path) = initial_file {
@@ -227,8 +265,8 @@ impl LzEditorApp {
             status_message,
             ime_preedit: String::new(),
             ime_active: false,
-            font_size: 16.0,
-            line_height: 23.0,
+            font_size: DEFAULT_FONT_SIZE,
+            line_height: calc_line_height(DEFAULT_FONT_SIZE),
             need_scroll_to_cursor: false,
             last_visible_lines: 24,
             last_filer_visible_rows: 20,
@@ -269,6 +307,98 @@ impl LzEditorApp {
         self.buffers.iter().any(|s| s.buffer.dirty)
     }
 
+    fn is_markdown_view(&self) -> bool {
+        self.mode == AppMode::Editor && self.cur_slot().markdown_view
+    }
+
+    // --- Font Size Scaling ---
+
+    fn set_font_size(&mut self, new_size: f32) {
+        let clamped = new_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE).round();
+        self.font_size = clamped;
+        self.line_height = calc_line_height(clamped);
+        self.need_scroll_to_cursor = true;
+        self.filer.left.need_scroll_to_cursor = true;
+        self.filer.right.need_scroll_to_cursor = true;
+        self.status_message = format!("フォントサイズ: {}pt", clamped as i32);
+    }
+
+    fn zoom_in_font(&mut self) {
+        self.set_font_size(self.font_size + FONT_SIZE_STEP);
+    }
+
+    fn zoom_out_font(&mut self) {
+        self.set_font_size(self.font_size - FONT_SIZE_STEP);
+    }
+
+    fn reset_font_size(&mut self) {
+        self.set_font_size(DEFAULT_FONT_SIZE);
+    }
+
+    fn handle_font_zoom_key(&mut self, key: Key, modifiers: egui::Modifiers) -> bool {
+        let ctrl = modifiers.ctrl || modifiers.command;
+        if !ctrl || modifiers.alt {
+            return false;
+        }
+        match key {
+            Key::Plus | Key::Equals => {
+                self.zoom_in_font();
+                true
+            }
+            // JIS keyboard fallback where Shift+; is '+'
+            Key::Semicolon if modifiers.shift => {
+                self.zoom_in_font();
+                true
+            }
+            Key::Minus => {
+                self.zoom_out_font();
+                true
+            }
+            Key::Num0 => {
+                self.reset_font_size();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // --- Markdown View Mode ---
+
+    fn toggle_markdown_view(&mut self) {
+        self.prefix = PrefixKey::None;
+        self.ime_preedit.clear();
+        let slot = self.cur_slot_mut();
+        slot.markdown_view = !slot.markdown_view;
+        let now_view = slot.markdown_view;
+        if now_view {
+            slot.md_scroll_dirty = true;
+            self.status_message =
+                "Markdown ビューモード [VIEW] (^P / Alt+P / ^K^V で編集へ戻る)".to_string();
+        } else {
+            self.need_scroll_to_cursor = true;
+            self.status_message =
+                "テキスト編集モード [EDIT] (^P / Alt+P / ^K^V でプレビューへ)".to_string();
+        }
+    }
+
+    fn scroll_markdown_by(&mut self, delta_y: f32) {
+        let slot = self.cur_slot_mut();
+        slot.md_scroll_y = (slot.md_scroll_y + delta_y).clamp(0.0, slot.md_max_scroll_y);
+        slot.md_scroll_dirty = true;
+    }
+
+    fn scroll_markdown_to_top(&mut self) {
+        let slot = self.cur_slot_mut();
+        slot.md_scroll_y = 0.0;
+        slot.md_scroll_dirty = true;
+    }
+
+    fn scroll_markdown_to_bottom(&mut self) {
+        let slot = self.cur_slot_mut();
+        slot.md_scroll_y = slot.md_max_scroll_y;
+        slot.md_scroll_dirty = true;
+    }
+
     // --- Mode Switching ---
 
     fn enter_filer(&mut self) {
@@ -287,12 +417,21 @@ impl LzEditorApp {
         self.filer_modal = None;
         self.mode = AppMode::Editor;
         self.need_scroll_to_cursor = true;
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().md_scroll_dirty = true;
+        }
         let name = self.cur_buf().display_name();
+        let mode_tag = if self.cur_slot().markdown_view {
+            " [VIEW]"
+        } else {
+            ""
+        };
         self.status_message = format!(
-            "エディタ [{}/{}]: {}",
+            "エディタ [{}/{}]: {}{}",
             self.active_buf + 1,
             self.buffers.len(),
-            name
+            name,
+            mode_tag
         );
     }
 
@@ -311,6 +450,9 @@ impl LzEditorApp {
             self.active_buf = existing_idx;
             self.mode = AppMode::Editor;
             self.need_scroll_to_cursor = true;
+            if self.cur_slot().markdown_view {
+                self.cur_slot_mut().md_scroll_dirty = true;
+            }
             let name = self.cur_buf().display_name();
             self.status_message = format!(
                 "既存バッファへ切替 [{}/{}]: {}",
@@ -324,6 +466,7 @@ impl LzEditorApp {
         match TextBuffer::from_file(&path) {
             Ok(buf) => {
                 let display_path = path.display().to_string();
+                let is_md = buf.is_markdown();
                 if self.buffers.len() == 1 && self.buffers[0].is_untouched_untitled() {
                     self.buffers[0] = BufferSlot::new(buf);
                     self.active_buf = 0;
@@ -333,12 +476,21 @@ impl LzEditorApp {
                 }
                 self.mode = AppMode::Editor;
                 self.need_scroll_to_cursor = true;
-                self.status_message = format!(
-                    "開きました [{}/{}]: {}",
-                    self.active_buf + 1,
-                    self.buffers.len(),
-                    display_path
-                );
+                if is_md {
+                    self.status_message = format!(
+                        "開きました [{}/{}]: {} (^PでMDビュー切替)",
+                        self.active_buf + 1,
+                        self.buffers.len(),
+                        display_path
+                    );
+                } else {
+                    self.status_message = format!(
+                        "開きました [{}/{}]: {}",
+                        self.active_buf + 1,
+                        self.buffers.len(),
+                        display_path
+                    );
+                }
             }
             Err(e) => {
                 self.status_message = format!("読み込みエラー: {e}");
@@ -371,8 +523,17 @@ impl LzEditorApp {
         self.prefix = PrefixKey::None;
         self.ime_preedit.clear();
         self.need_scroll_to_cursor = true;
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().md_scroll_dirty = true;
+        }
         let name = self.cur_buf().display_name();
-        self.status_message = format!("バッファ切替 [{}/{}]: {}", next + 1, count, name);
+        let mode_tag = if self.cur_slot().markdown_view {
+            " [VIEW]"
+        } else {
+            ""
+        };
+        self.status_message =
+            format!("バッファ切替 [{}/{}]: {}{}", next + 1, count, name, mode_tag);
     }
 
     fn switch_buffer_to(&mut self, idx: usize) {
@@ -381,9 +542,22 @@ impl LzEditorApp {
             self.prefix = PrefixKey::None;
             self.ime_preedit.clear();
             self.need_scroll_to_cursor = true;
+            if self.cur_slot().markdown_view {
+                self.cur_slot_mut().md_scroll_dirty = true;
+            }
             let name = self.cur_buf().display_name();
-            self.status_message =
-                format!("バッファ切替 [{}/{}]: {}", idx + 1, self.buffers.len(), name);
+            let mode_tag = if self.cur_slot().markdown_view {
+                " [VIEW]"
+            } else {
+                ""
+            };
+            self.status_message = format!(
+                "バッファ切替 [{}/{}]: {}{}",
+                idx + 1,
+                self.buffers.len(),
+                name,
+                mode_tag
+            );
         }
     }
 
@@ -483,6 +657,7 @@ impl LzEditorApp {
 
     fn execute_editor_action(&mut self, action: EditorAction) {
         self.prefix = PrefixKey::None;
+        let in_md_view = self.is_markdown_view();
         match action {
             EditorAction::ToggleHelp => {
                 self.show_help = !self.show_help;
@@ -494,25 +669,48 @@ impl LzEditorApp {
                 self.trigger_open();
             }
             EditorAction::MoveLineStart => {
-                self.cur_buf_mut().move_line_start();
-                self.need_scroll_to_cursor = true;
+                if in_md_view {
+                    self.scroll_markdown_to_top();
+                } else {
+                    self.cur_buf_mut().move_line_start();
+                    self.need_scroll_to_cursor = true;
+                }
             }
             EditorAction::MoveLineEnd => {
-                self.cur_buf_mut().move_line_end();
-                self.need_scroll_to_cursor = true;
+                if in_md_view {
+                    self.scroll_markdown_to_bottom();
+                } else {
+                    self.cur_buf_mut().move_line_end();
+                    self.need_scroll_to_cursor = true;
+                }
             }
             EditorAction::DeleteLine => {
-                self.cur_buf_mut().delete_current_line();
-                self.need_scroll_to_cursor = true;
-                self.status_message = "現在行を削除しました (^Y)".to_string();
+                if in_md_view {
+                    self.status_message =
+                        "ビューモード中は編集できません (^P / Alt+P で編集モードへ)".to_string();
+                } else {
+                    self.cur_buf_mut().delete_current_line();
+                    self.need_scroll_to_cursor = true;
+                    self.status_message = "現在行を削除しました (^Y)".to_string();
+                }
             }
             EditorAction::MoveWordLeft => {
-                self.cur_buf_mut().move_word_left();
-                self.need_scroll_to_cursor = true;
+                if in_md_view {
+                    let step = (self.cur_slot().md_viewport_h * 0.5).max(self.line_height * 4.0);
+                    self.scroll_markdown_by(-step);
+                } else {
+                    self.cur_buf_mut().move_word_left();
+                    self.need_scroll_to_cursor = true;
+                }
             }
             EditorAction::MoveWordRight => {
-                self.cur_buf_mut().move_word_right();
-                self.need_scroll_to_cursor = true;
+                if in_md_view {
+                    let step = (self.cur_slot().md_viewport_h * 0.5).max(self.line_height * 4.0);
+                    self.scroll_markdown_by(step);
+                } else {
+                    self.cur_buf_mut().move_word_right();
+                    self.need_scroll_to_cursor = true;
+                }
             }
             EditorAction::SwitchToFiler => {
                 self.enter_filer();
@@ -645,18 +843,21 @@ impl LzEditorApp {
         let mut suppress_text_this_frame = false;
 
         for event in events {
+            let in_md_view = self.is_markdown_view();
             match event {
                 Event::Ime(ime_ev) => match ime_ev {
                     ImeEvent::Enabled => {
                         self.ime_active = true;
                     }
                     ImeEvent::Preedit(text) => {
-                        self.ime_preedit = text;
-                        self.need_scroll_to_cursor = true;
+                        if !in_md_view {
+                            self.ime_preedit = text;
+                            self.need_scroll_to_cursor = true;
+                        }
                     }
                     ImeEvent::Commit(text) => {
                         self.ime_preedit.clear();
-                        if !text.is_empty() {
+                        if !in_md_view && !text.is_empty() {
                             self.prefix = PrefixKey::None;
                             self.cur_buf_mut().insert_text(&text);
                             self.need_scroll_to_cursor = true;
@@ -668,15 +869,19 @@ impl LzEditorApp {
                     }
                 },
 
-                // egui_winit translates Ctrl+X to Event::Cut -> VZ diamond cursor DOWN!
+                // egui_winit translates Ctrl+X to Event::Cut -> VZ diamond cursor DOWN (or MD scroll down)!
                 Event::Cut => {
                     if !self.ime_preedit.is_empty() {
                         continue;
                     }
                     suppress_text_this_frame = true;
                     if self.prefix == PrefixKey::None {
-                        self.cur_buf_mut().move_down();
-                        self.need_scroll_to_cursor = true;
+                        if in_md_view {
+                            self.scroll_markdown_by(self.line_height * 2.5);
+                        } else {
+                            self.cur_buf_mut().move_down();
+                            self.need_scroll_to_cursor = true;
+                        }
                     } else {
                         self.prefix = PrefixKey::None;
                         self.status_message.clear();
@@ -691,8 +896,12 @@ impl LzEditorApp {
                     suppress_text_this_frame = true;
                     if self.prefix == PrefixKey::CtrlQ {
                         self.prefix = PrefixKey::None;
-                        self.cur_buf_mut().move_doc_end();
-                        self.need_scroll_to_cursor = true;
+                        if in_md_view {
+                            self.scroll_markdown_to_bottom();
+                        } else {
+                            self.cur_buf_mut().move_doc_end();
+                            self.need_scroll_to_cursor = true;
+                        }
                         self.status_message = "ファイル末尾へ移動 (^Q^C)".to_string();
                     } else {
                         self.prefix = PrefixKey::None;
@@ -705,7 +914,7 @@ impl LzEditorApp {
                     }
                     suppress_text_this_frame = true;
                     self.prefix = PrefixKey::None;
-                    if !text.is_empty() {
+                    if !in_md_view && !text.is_empty() {
                         self.cur_buf_mut().insert_text(&text);
                         self.need_scroll_to_cursor = true;
                     }
@@ -730,23 +939,35 @@ impl LzEditorApp {
                             self.prefix = PrefixKey::None;
                             match key {
                                 Key::S => {
-                                    self.cur_buf_mut().move_line_start();
-                                    self.need_scroll_to_cursor = true;
-                                    self.status_message = "行頭へ移動 (^Q^S)".to_string();
+                                    if !in_md_view {
+                                        self.cur_buf_mut().move_line_start();
+                                        self.need_scroll_to_cursor = true;
+                                        self.status_message = "行頭へ移動 (^Q^S)".to_string();
+                                    }
                                 }
                                 Key::D => {
-                                    self.cur_buf_mut().move_line_end();
-                                    self.need_scroll_to_cursor = true;
-                                    self.status_message = "行末へ移動 (^Q^D)".to_string();
+                                    if !in_md_view {
+                                        self.cur_buf_mut().move_line_end();
+                                        self.need_scroll_to_cursor = true;
+                                        self.status_message = "行末へ移動 (^Q^D)".to_string();
+                                    }
                                 }
                                 Key::R => {
-                                    self.cur_buf_mut().move_doc_start();
-                                    self.need_scroll_to_cursor = true;
+                                    if in_md_view {
+                                        self.scroll_markdown_to_top();
+                                    } else {
+                                        self.cur_buf_mut().move_doc_start();
+                                        self.need_scroll_to_cursor = true;
+                                    }
                                     self.status_message = "ファイル先頭へ移動 (^Q^R)".to_string();
                                 }
                                 Key::C => {
-                                    self.cur_buf_mut().move_doc_end();
-                                    self.need_scroll_to_cursor = true;
+                                    if in_md_view {
+                                        self.scroll_markdown_to_bottom();
+                                    } else {
+                                        self.cur_buf_mut().move_doc_end();
+                                        self.need_scroll_to_cursor = true;
+                                    }
                                     self.status_message = "ファイル末尾へ移動 (^Q^C)".to_string();
                                 }
                                 Key::Escape => {
@@ -764,6 +985,9 @@ impl LzEditorApp {
                             match key {
                                 Key::D => {
                                     self.trigger_save();
+                                }
+                                Key::V => {
+                                    self.toggle_markdown_view();
                                 }
                                 Key::Q => {
                                     self.enter_filer();
@@ -816,39 +1040,73 @@ impl LzEditorApp {
                         continue;
                     }
 
+                    // 3.5. Font size zoom (Ctrl++ / Ctrl+= / Ctrl+- / Ctrl+0)
+                    if self.handle_font_zoom_key(key, modifiers) {
+                        suppress_text_this_frame = true;
+                        continue;
+                    }
+
+                    // 3.6. Alt+P: Markdown edit/view toggle
+                    if modifiers.alt && !ctrl && key == Key::P {
+                        suppress_text_this_frame = true;
+                        self.toggle_markdown_view();
+                        continue;
+                    }
+
                     // 4. VZ Ctrl-based bindings
                     if ctrl && !modifiers.alt {
                         let handled = match key {
-                            // Diamond cursor: Ctrl+E / S / D / X
+                            // Markdown Edit / View toggle: Ctrl+P
+                            Key::P => {
+                                self.toggle_markdown_view();
+                                true
+                            }
+                            // Diamond cursor: Ctrl+E / S / D / X (scroll in MD View)
                             Key::E => {
-                                self.cur_buf_mut().move_up();
-                                self.need_scroll_to_cursor = true;
+                                if in_md_view {
+                                    self.scroll_markdown_by(-self.line_height * 2.5);
+                                } else {
+                                    self.cur_buf_mut().move_up();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             Key::S => {
-                                self.cur_buf_mut().move_left();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().move_left();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             Key::D => {
-                                self.cur_buf_mut().move_right();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().move_right();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             Key::X => {
-                                self.cur_buf_mut().move_down();
-                                self.need_scroll_to_cursor = true;
+                                if in_md_view {
+                                    self.scroll_markdown_by(self.line_height * 2.5);
+                                } else {
+                                    self.cur_buf_mut().move_down();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             // Word left / right: Ctrl+A / Ctrl+F
                             Key::A => {
-                                self.cur_buf_mut().move_word_left();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().move_word_left();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             Key::F => {
-                                self.cur_buf_mut().move_word_right();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().move_word_right();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             // Multi-buffer switch (裏画面切替): Ctrl+W / Ctrl+Shift+W
@@ -862,27 +1120,35 @@ impl LzEditorApp {
                             }
                             // Delete current line: Ctrl+Y
                             Key::Y => {
-                                self.cur_buf_mut().delete_current_line();
-                                self.need_scroll_to_cursor = true;
-                                self.status_message = "現在行を削除しました (^Y)".to_string();
+                                if !in_md_view {
+                                    self.cur_buf_mut().delete_current_line();
+                                    self.need_scroll_to_cursor = true;
+                                    self.status_message = "現在行を削除しました (^Y)".to_string();
+                                }
                                 true
                             }
                             // Delete char at cursor: Ctrl+G
                             Key::G => {
-                                self.cur_buf_mut().delete_char_at_cursor();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().delete_char_at_cursor();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             // BackSpace: Ctrl+H
                             Key::H => {
-                                self.cur_buf_mut().backspace();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().backspace();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             // Enter: Ctrl+M
                             Key::M => {
-                                self.cur_buf_mut().insert_newline();
-                                self.need_scroll_to_cursor = true;
+                                if !in_md_view {
+                                    self.cur_buf_mut().insert_newline();
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             // Prefix keys: Ctrl+Q, Ctrl+K
@@ -895,14 +1161,21 @@ impl LzEditorApp {
                             Key::K => {
                                 self.prefix = PrefixKey::CtrlK;
                                 self.status_message =
-                                    "^K  [D:保存  Q:ファイラー  ESC:取消]".to_string();
+                                    "^K  [D:保存  V:MDビュー切替  Q:ファイラー  ESC:取消]"
+                                        .to_string();
                                 true
                             }
                             // Page up: Ctrl+R
                             Key::R => {
-                                let lines = self.last_visible_lines;
-                                self.cur_buf_mut().move_page_up(lines);
-                                self.need_scroll_to_cursor = true;
+                                if in_md_view {
+                                    let step = (self.cur_slot().md_viewport_h * 0.85)
+                                        .max(self.line_height * 4.0);
+                                    self.scroll_markdown_by(-step);
+                                } else {
+                                    let lines = self.last_visible_lines;
+                                    self.cur_buf_mut().move_page_up(lines);
+                                    self.need_scroll_to_cursor = true;
+                                }
                                 true
                             }
                             _ => false,
@@ -915,64 +1188,93 @@ impl LzEditorApp {
 
                     // 5. Standard navigation & editing keys
                     if !ctrl && !modifiers.alt {
-                        match key {
-                            Key::ArrowUp => {
-                                self.cur_buf_mut().move_up();
-                                self.need_scroll_to_cursor = true;
+                        if in_md_view {
+                            match key {
+                                Key::ArrowUp => {
+                                    self.scroll_markdown_by(-self.line_height * 2.5);
+                                }
+                                Key::ArrowDown => {
+                                    self.scroll_markdown_by(self.line_height * 2.5);
+                                }
+                                Key::PageUp => {
+                                    let step = (self.cur_slot().md_viewport_h * 0.85)
+                                        .max(self.line_height * 4.0);
+                                    self.scroll_markdown_by(-step);
+                                }
+                                Key::PageDown | Key::Space => {
+                                    let step = (self.cur_slot().md_viewport_h * 0.85)
+                                        .max(self.line_height * 4.0);
+                                    self.scroll_markdown_by(step);
+                                }
+                                Key::Home => {
+                                    self.scroll_markdown_to_top();
+                                }
+                                Key::End => {
+                                    self.scroll_markdown_to_bottom();
+                                }
+                                _ => {}
                             }
-                            Key::ArrowDown => {
-                                self.cur_buf_mut().move_down();
-                                self.need_scroll_to_cursor = true;
+                        } else {
+                            match key {
+                                Key::ArrowUp => {
+                                    self.cur_buf_mut().move_up();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::ArrowDown => {
+                                    self.cur_buf_mut().move_down();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::ArrowLeft => {
+                                    self.cur_buf_mut().move_left();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::ArrowRight => {
+                                    self.cur_buf_mut().move_right();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::Home => {
+                                    self.cur_buf_mut().move_line_start();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::End => {
+                                    self.cur_buf_mut().move_line_end();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::PageUp => {
+                                    let lines = self.last_visible_lines;
+                                    self.cur_buf_mut().move_page_up(lines);
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::PageDown => {
+                                    let lines = self.last_visible_lines;
+                                    self.cur_buf_mut().move_page_down(lines);
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::Enter => {
+                                    self.cur_buf_mut().insert_newline();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::Backspace => {
+                                    self.cur_buf_mut().backspace();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::Delete => {
+                                    self.cur_buf_mut().delete_char_at_cursor();
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                Key::Tab => {
+                                    self.cur_buf_mut().insert_text("\t");
+                                    self.need_scroll_to_cursor = true;
+                                }
+                                _ => {}
                             }
-                            Key::ArrowLeft => {
-                                self.cur_buf_mut().move_left();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::ArrowRight => {
-                                self.cur_buf_mut().move_right();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::Home => {
-                                self.cur_buf_mut().move_line_start();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::End => {
-                                self.cur_buf_mut().move_line_end();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::PageUp => {
-                                let lines = self.last_visible_lines;
-                                self.cur_buf_mut().move_page_up(lines);
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::PageDown => {
-                                let lines = self.last_visible_lines;
-                                self.cur_buf_mut().move_page_down(lines);
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::Enter => {
-                                self.cur_buf_mut().insert_newline();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::Backspace => {
-                                self.cur_buf_mut().backspace();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::Delete => {
-                                self.cur_buf_mut().delete_char_at_cursor();
-                                self.need_scroll_to_cursor = true;
-                            }
-                            Key::Tab => {
-                                self.cur_buf_mut().insert_text("\t");
-                                self.need_scroll_to_cursor = true;
-                            }
-                            _ => {}
                         }
                     }
                 }
 
                 Event::Text(text) => {
-                    if suppress_text_this_frame
+                    if in_md_view
+                        || suppress_text_this_frame
                         || !self.ime_preedit.is_empty()
                         || self.prefix != PrefixKey::None
                         || modifiers_now.ctrl
@@ -1041,6 +1343,11 @@ impl LzEditorApp {
                             self.enter_editor();
                             return;
                         }
+                        continue;
+                    }
+
+                    // Font size zoom (Ctrl++ / Ctrl+= / Ctrl+- / Ctrl+0)
+                    if self.handle_font_zoom_key(key, modifiers) {
                         continue;
                     }
 
@@ -1131,8 +1438,85 @@ impl LzEditorApp {
 
     // --- Status Bar & Multi-Buffer Strip ---
 
+    fn paint_font_size_controls(ui: &mut egui::Ui, font_size: f32) -> Option<i8> {
+        // Returns Some(-1) for shrink, Some(0) for reset, Some(1) for enlarge.
+        // Rendered inside a right_to_left layout: add '+', then '16pt', then '-' so visually: [-] 16pt [+]
+        let mut cmd: Option<i8> = None;
+        let is_default = (font_size - DEFAULT_FONT_SIZE).abs() < 0.1;
+
+        let plus_resp = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("+")
+                        .font(FontId::monospace(12.5))
+                        .strong()
+                        .color(if font_size < MAX_FONT_SIZE {
+                            TEXT_CYAN
+                        } else {
+                            TEXT_DIM_CYAN
+                        }),
+                )
+                .fill(BG_TAB_INACTIVE)
+                .stroke(Stroke::new(1.0_f32, BORDER_BLUE))
+                .corner_radius(CornerRadius::same(2))
+                .min_size(Vec2::new(18.0, 18.0)),
+            )
+            .on_hover_text("フォント拡大 (Ctrl++ / Ctrl+=)");
+        if plus_resp.clicked() {
+            cmd = Some(1);
+        }
+
+        let pt_label = format!("{}pt", font_size.round() as i32);
+        let pt_resp = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(pt_label)
+                        .font(FontId::monospace(12.5))
+                        .strong()
+                        .color(if is_default { TEXT_WHITE } else { TEXT_AMBER }),
+                )
+                .fill(BG_TAB_INACTIVE)
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if is_default { BORDER_BLUE } else { TEXT_AMBER },
+                ))
+                .corner_radius(CornerRadius::same(2))
+                .min_size(Vec2::new(40.0, 18.0)),
+            )
+            .on_hover_text("クリックでデフォルトサイズ (16pt) へリセット (Ctrl+0)");
+        if pt_resp.clicked() {
+            cmd = Some(0);
+        }
+
+        let minus_resp = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("-")
+                        .font(FontId::monospace(12.5))
+                        .strong()
+                        .color(if font_size > MIN_FONT_SIZE {
+                            TEXT_CYAN
+                        } else {
+                            TEXT_DIM_CYAN
+                        }),
+                )
+                .fill(BG_TAB_INACTIVE)
+                .stroke(Stroke::new(1.0_f32, BORDER_BLUE))
+                .corner_radius(CornerRadius::same(2))
+                .min_size(Vec2::new(18.0, 18.0)),
+            )
+            .on_hover_text("フォント縮小 (Ctrl+-)");
+        if minus_resp.clicked() {
+            cmd = Some(-1);
+        }
+
+        cmd
+    }
+
     fn render_status_bar(&mut self, ctx: &egui::Context) {
         let mut switch_next_clicked = false;
+        let mut toggle_md_clicked = false;
+        let mut font_cmd: Option<i8> = None;
 
         egui::TopBottomPanel::top("status_bar")
             .exact_height(30.0)
@@ -1203,6 +1587,41 @@ impl LzEditorApp {
                             );
                         }
 
+                        // Markdown [EDIT] / [VIEW] clickable toggle badge
+                        let is_md = self.cur_buf().is_markdown();
+                        let in_view = self.cur_slot().markdown_view;
+                        if is_md || in_view {
+                            ui.add_space(6.0);
+                            let (md_label, md_bg, md_fg, md_stroke) = if in_view {
+                                (
+                                    "[VIEW]",
+                                    STATUS_BADGE_VIEW_BG,
+                                    STATUS_BADGE_FG,
+                                    STATUS_BADGE_VIEW_BG,
+                                )
+                            } else {
+                                ("[EDIT]", BG_TAB_INACTIVE, TEXT_CYAN, BORDER_BLUE)
+                            };
+                            let md_resp = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(md_label)
+                                            .font(FontId::monospace(12.5))
+                                            .strong()
+                                            .color(md_fg),
+                                    )
+                                    .fill(md_bg)
+                                    .stroke(Stroke::new(1.0_f32, md_stroke))
+                                    .corner_radius(CornerRadius::same(2)),
+                                )
+                                .on_hover_text(
+                                    "クリックまたは Ctrl+P / Alt+P / Ctrl+K+V で Markdown 編集/ビュー切替",
+                                );
+                            if md_resp.clicked() {
+                                toggle_md_clicked = true;
+                            }
+                        }
+
                         // Prefix key badge (^Q / ^K)
                         if self.prefix != PrefixKey::None {
                             ui.add_space(8.0);
@@ -1225,43 +1644,53 @@ impl LzEditorApp {
                                 });
                         }
 
-                        // Status message
+                        // Status message (truncated so right-aligned controls never clip)
                         if !self.status_message.is_empty() {
-                            ui.add_space(10.0);
-                            let msg_color = if self.status_message.contains("エラー") {
-                                TEXT_AMBER
-                            } else {
-                                TEXT_CYAN
-                            };
-                            ui.label(
-                                egui::RichText::new(&self.status_message)
-                                    .font(FontId::monospace(13.0))
-                                    .color(msg_color),
-                            );
+                            let right_reserve = 380.0_f32;
+                            let avail_msg_w = ui.available_width() - right_reserve;
+                            if avail_msg_w > 48.0 {
+                                ui.add_space(8.0);
+                                let max_cols = ((avail_msg_w - 8.0) / 7.6).floor().max(6.0) as usize;
+                                let clipped = truncate_display_right(&self.status_message, max_cols);
+                                let msg_color = if self.status_message.contains("エラー") {
+                                    TEXT_AMBER
+                                } else {
+                                    TEXT_CYAN
+                                };
+                                ui.label(
+                                    egui::RichText::new(clipped)
+                                        .font(FontId::monospace(12.5))
+                                        .color(msg_color),
+                                );
+                            }
                         }
 
-                        // Right-aligned encoding + line/column info
+                        // Right-aligned encoding + line/column info + font size controls
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let buf = self.cur_buf();
-                            let pos_text = format!(
-                                "Ln {:>4}/{:<4}  Col {:>3}",
-                                buf.display_line_num(),
-                                buf.lines.len(),
-                                buf.display_col_num()
-                            );
+                            let pos_text = if self.cur_slot().markdown_view {
+                                format!("全{}行 [VIEW]", buf.lines.len())
+                            } else {
+                                format!(
+                                    "Ln {:>4}/{:<4}  Col {:>3}",
+                                    buf.display_line_num(),
+                                    buf.lines.len(),
+                                    buf.display_col_num()
+                                )
+                            };
                             ui.label(
                                 egui::RichText::new(pos_text)
-                                    .font(FontId::monospace(13.5))
+                                    .font(FontId::monospace(13.0))
                                     .color(TEXT_CYAN),
                             );
 
-                            ui.add_space(10.0);
+                            ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new("|")
                                     .font(FontId::monospace(13.0))
                                     .color(BORDER_BLUE),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(6.0);
 
                             let eol = if buf.line_ending == "\r\n" {
                                 "CRLF"
@@ -1270,12 +1699,26 @@ impl LzEditorApp {
                             };
                             ui.label(
                                 egui::RichText::new(format!("{} {}", buf.encoding, eol))
-                                    .font(FontId::monospace(13.5))
+                                    .font(FontId::monospace(13.0))
                                     .color(TEXT_WHITE),
                             );
 
-                            if self.ime_active || !self.ime_preedit.is_empty() {
-                                ui.add_space(10.0);
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("|")
+                                    .font(FontId::monospace(13.0))
+                                    .color(BORDER_BLUE),
+                            );
+                            ui.add_space(6.0);
+
+                            if let Some(cmd) = Self::paint_font_size_controls(ui, self.font_size) {
+                                font_cmd = Some(cmd);
+                            }
+
+                            if !self.cur_slot().markdown_view
+                                && (self.ime_active || !self.ime_preedit.is_empty())
+                            {
+                                ui.add_space(8.0);
                                 egui::Frame::NONE
                                     .fill(PREEDIT_BG)
                                     .corner_radius(CornerRadius::same(2))
@@ -1338,19 +1781,25 @@ impl LzEditorApp {
                         }
 
                         if !self.status_message.is_empty() {
-                            ui.add_space(10.0);
-                            let msg_color = if self.status_message.contains("エラー")
-                                || self.status_message.contains("失敗")
-                            {
-                                TEXT_AMBER
-                            } else {
-                                TEXT_CYAN
-                            };
-                            ui.label(
-                                egui::RichText::new(&self.status_message)
-                                    .font(FontId::monospace(13.0))
-                                    .color(msg_color),
-                            );
+                            let right_reserve = 250.0_f32;
+                            let avail_msg_w = ui.available_width() - right_reserve;
+                            if avail_msg_w > 48.0 {
+                                ui.add_space(10.0);
+                                let max_cols = ((avail_msg_w - 10.0) / 7.8).floor().max(6.0) as usize;
+                                let clipped = truncate_display_right(&self.status_message, max_cols);
+                                let msg_color = if self.status_message.contains("エラー")
+                                    || self.status_message.contains("失敗")
+                                {
+                                    TEXT_AMBER
+                                } else {
+                                    TEXT_CYAN
+                                };
+                                ui.label(
+                                    egui::RichText::new(clipped)
+                                        .font(FontId::monospace(13.0))
+                                        .color(msg_color),
+                                );
+                            }
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1364,6 +1813,18 @@ impl LzEditorApp {
                                     .font(FontId::monospace(13.0))
                                     .color(TEXT_CYAN),
                             );
+
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("|")
+                                    .font(FontId::monospace(13.0))
+                                    .color(BORDER_BLUE),
+                            );
+                            ui.add_space(6.0);
+
+                            if let Some(cmd) = Self::paint_font_size_controls(ui, self.font_size) {
+                                font_cmd = Some(cmd);
+                            }
                         });
                     }
                 });
@@ -1371,6 +1832,16 @@ impl LzEditorApp {
 
         if switch_next_clicked {
             self.switch_buffer_step(1);
+        }
+        if toggle_md_clicked {
+            self.toggle_markdown_view();
+        }
+        if let Some(cmd) = font_cmd {
+            match cmd {
+                1 => self.zoom_in_font(),
+                -1 => self.zoom_out_font(),
+                _ => self.reset_font_size(),
+            }
         }
     }
 
@@ -1401,8 +1872,14 @@ impl LzEditorApp {
                     for (idx, slot) in self.buffers.iter().enumerate() {
                         let is_active = idx == self.active_buf;
                         let dirty_mark = if slot.buffer.dirty { "*" } else { "" };
-                        let title =
-                            format!("{}:{}{}", idx + 1, slot.buffer.display_name(), dirty_mark);
+                        let view_mark = if slot.markdown_view { "[V]" } else { "" };
+                        let title = format!(
+                            "{}:{}{}{}",
+                            idx + 1,
+                            slot.buffer.display_name(),
+                            dirty_mark,
+                            view_mark
+                        );
                         let resp = ui.add(
                             egui::Button::new(
                                 egui::RichText::new(title)
@@ -1446,20 +1923,41 @@ impl LzEditorApp {
     }
 
     fn render_editor_fkey_bar(&mut self, ctx: &egui::Context) {
-        let keys_left: &[(&str, &str, EditorAction)] = &[
-            ("F1", "ヘルプ", EditorAction::ToggleHelp),
-            ("F2", "新規", EditorAction::NewBuffer),
-            ("F3", "開く", EditorAction::OpenFile),
-            ("F4", "行頭", EditorAction::MoveLineStart),
-            ("F5", "行末", EditorAction::MoveLineEnd),
-        ];
-        let keys_right: &[(&str, &str, EditorAction)] = &[
-            ("F6", "行削除", EditorAction::DeleteLine),
-            ("F7", "単語左", EditorAction::MoveWordLeft),
-            ("F8", "単語右", EditorAction::MoveWordRight),
-            ("F9", "ファイラ", EditorAction::SwitchToFiler),
-            ("F10", "保存", EditorAction::SaveFile),
-        ];
+        let in_md_view = self.is_markdown_view();
+        let keys_left: &[(&str, &str, EditorAction)] = if in_md_view {
+            &[
+                ("F1", "ヘルプ", EditorAction::ToggleHelp),
+                ("F2", "新規", EditorAction::NewBuffer),
+                ("F3", "開く", EditorAction::OpenFile),
+                ("F4", "先頭", EditorAction::MoveLineStart),
+                ("F5", "末尾", EditorAction::MoveLineEnd),
+            ]
+        } else {
+            &[
+                ("F1", "ヘルプ", EditorAction::ToggleHelp),
+                ("F2", "新規", EditorAction::NewBuffer),
+                ("F3", "開く", EditorAction::OpenFile),
+                ("F4", "行頭", EditorAction::MoveLineStart),
+                ("F5", "行末", EditorAction::MoveLineEnd),
+            ]
+        };
+        let keys_right: &[(&str, &str, EditorAction)] = if in_md_view {
+            &[
+                ("F6", "行削除", EditorAction::DeleteLine),
+                ("F7", "半頁上", EditorAction::MoveWordLeft),
+                ("F8", "半頁下", EditorAction::MoveWordRight),
+                ("F9", "ファイラ", EditorAction::SwitchToFiler),
+                ("F10", "保存", EditorAction::SaveFile),
+            ]
+        } else {
+            &[
+                ("F6", "行削除", EditorAction::DeleteLine),
+                ("F7", "単語左", EditorAction::MoveWordLeft),
+                ("F8", "単語右", EditorAction::MoveWordRight),
+                ("F9", "ファイラ", EditorAction::SwitchToFiler),
+                ("F10", "保存", EditorAction::SaveFile),
+            ]
+        };
 
         let mut clicked_action: Option<EditorAction> = None;
 
@@ -1633,7 +2131,45 @@ impl LzEditorApp {
         response.clicked()
     }
 
-    // --- Main Center View (Editor or 2-Pane Filer) ---
+    // --- Main Center View (Editor, Markdown View, or 2-Pane Filer) ---
+
+    fn render_markdown_canvas(&mut self, ctx: &egui::Context) {
+        // Disable IME while viewing Markdown so navigation/shortcut keys work cleanly.
+        ctx.output_mut(|o| {
+            o.ime = None;
+        });
+
+        let active_idx = self.active_buf;
+        let font_size = self.font_size;
+        self.cur_slot_mut().ensure_md_cache();
+
+        let mut clicked_url: Option<String> = None;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BG_NAVY))
+            .show(ctx, |ui| {
+                let slot = &mut self.buffers[active_idx];
+                let apply_offset = slot.md_scroll_dirty;
+                let out = render_markdown_view(
+                    ui,
+                    active_idx,
+                    &slot.md_blocks,
+                    font_size,
+                    slot.md_scroll_y,
+                    apply_offset,
+                );
+                slot.md_scroll_y = out.scroll_y;
+                slot.md_max_scroll_y = out.max_scroll_y;
+                slot.md_viewport_h = out.viewport_h;
+                slot.md_scroll_dirty = false;
+                clicked_url = out.clicked_url;
+            });
+
+        if let Some(url) = clicked_url {
+            ctx.open_url(egui::OpenUrl::new_tab(&url));
+            self.status_message = format!("リンクを開きました: {url}");
+        }
+    }
 
     fn render_editor_canvas(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
@@ -1642,32 +2178,29 @@ impl LzEditorApp {
                 let avail_rect = ui.available_rect_before_wrap();
                 let response = ui.allocate_rect(avail_rect, Sense::click_and_drag());
 
+                let font_id = FontId::monospace(self.font_size);
+                let gutter_font_size = (self.font_size * 0.875).max(9.0);
+                let marker_font_size = (self.font_size * 0.875).max(9.0);
+
                 let scrollbar_w = 12.0;
                 let total_lines = self.cur_buf().lines.len();
                 let line_digits = total_lines.max(999).to_string().len();
-                let gutter_w = (line_digits as f32 * 9.5 + 18.0).max(54.0);
-                let top_pad = 6.0;
-                let left_pad = 10.0;
 
-                let editor_rect = Rect::from_min_max(
-                    Pos2::new(avail_rect.min.x + gutter_w, avail_rect.min.y),
-                    Pos2::new(avail_rect.max.x - scrollbar_w, avail_rect.max.y),
-                );
-                let viewport_h = (editor_rect.height() - top_pad * 2.0).max(self.line_height);
-                let viewport_w = (editor_rect.width() - left_pad * 2.0).max(40.0);
-                self.last_visible_lines = (viewport_h / self.line_height).floor().max(1.0) as usize;
-
-                let font_id = FontId::monospace(self.font_size);
-
-                // Measure cursor X position in pixels
+                // Measure cursor X, preedit width, gutter width, and cursor cell width from actual font metrics
                 let cursor_line = self.cur_buf().cursor_line;
                 let cursor_col = self.cur_buf().cursor_col;
                 let cursor_line_str = self.cur_buf().current_line_str().to_string();
                 let cursor_byte = char_to_byte_idx(&cursor_line_str, cursor_col);
                 let before_cursor_disp = expand_tabs_for_display(&cursor_line_str[..cursor_byte]);
                 let preedit_disp = expand_tabs_for_display(&self.ime_preedit);
+                let char_under_cursor = cursor_line_str[cursor_byte..].chars().next();
+                let cursor_sample = match char_under_cursor {
+                    Some('\t') => "    ".to_string(),
+                    Some(c) => c.to_string(),
+                    None => "M".to_string(),
+                };
 
-                let (cursor_px_x, preedit_px_w) = ui.fonts(|f| {
+                let (cursor_px_x, preedit_px_w, gutter_text_w, cursor_w) = ui.fonts(|f| {
                     let g_before =
                         f.layout_no_wrap(before_cursor_disp.clone(), font_id.clone(), TEXT_WHITE);
                     let x = g_before.size().x;
@@ -1678,8 +2211,41 @@ impl LzEditorApp {
                             .size()
                             .x
                     };
-                    (x, pw)
+                    let gw = f
+                        .layout_no_wrap(
+                            "9".repeat(line_digits),
+                            FontId::monospace(gutter_font_size),
+                            TEXT_DIM_CYAN,
+                        )
+                        .size()
+                        .x;
+                    let half_cell_w = f
+                        .layout_no_wrap("M".to_string(), font_id.clone(), TEXT_WHITE)
+                        .size()
+                        .x
+                        .max(self.font_size * 0.55);
+                    let char_w = f
+                        .layout_no_wrap(cursor_sample.clone(), font_id.clone(), TEXT_WHITE)
+                        .size()
+                        .x;
+                    (x, pw, gw, char_w.max(half_cell_w))
                 });
+
+                let gutter_pad = (self.font_size * 1.1).clamp(14.0, 28.0);
+                let gutter_w = (gutter_text_w + gutter_pad).max(48.0);
+                let top_pad = 6.0;
+                let left_pad = (self.font_size * 0.625).clamp(8.0, 18.0);
+
+                let editor_rect = Rect::from_min_max(
+                    Pos2::new(avail_rect.min.x + gutter_w, avail_rect.min.y),
+                    Pos2::new(
+                        (avail_rect.max.x - scrollbar_w).max(avail_rect.min.x + gutter_w + 20.0),
+                        avail_rect.max.y,
+                    ),
+                );
+                let viewport_h = (editor_rect.height() - top_pad * 2.0).max(self.line_height);
+                let viewport_w = (editor_rect.width() - left_pad * 2.0).max(40.0);
+                self.last_visible_lines = (viewport_h / self.line_height).floor().max(1.0) as usize;
 
                 let mut scroll_y = self.cur_slot().scroll_y;
                 let mut scroll_x = self.cur_slot().scroll_x;
@@ -1704,9 +2270,9 @@ impl LzEditorApp {
                         scroll_y = cursor_px_y + self.line_height - viewport_h;
                     }
 
-                    let caret_end_x = cursor_px_x + preedit_px_w + 16.0;
+                    let caret_end_x = cursor_px_x + preedit_px_w + cursor_w + 8.0;
                     if cursor_px_x < scroll_x {
-                        scroll_x = (cursor_px_x - 24.0).max(0.0);
+                        scroll_x = (cursor_px_x - cursor_w * 2.0).max(0.0);
                     } else if caret_end_x > scroll_x + viewport_w {
                         scroll_x = (caret_end_x - viewport_w).max(0.0);
                     }
@@ -1809,7 +2375,7 @@ impl LzEditorApp {
                         Pos2::new(gutter_rect.max.x - 8.0, y + self.line_height * 0.5),
                         Align2::RIGHT_CENTER,
                         num_str,
-                        FontId::monospace(self.font_size - 2.0),
+                        FontId::monospace(gutter_font_size),
                         if is_current { TEXT_CYAN } else { TEXT_DIM_CYAN },
                     );
 
@@ -1842,16 +2408,17 @@ impl LzEditorApp {
                         let pw = g_pre.size().x;
                         let pre_rect = Rect::from_min_size(
                             Pos2::new(cur_x, y + 1.0),
-                            Vec2::new(pw.max(4.0), self.line_height - 2.0),
+                            Vec2::new(pw.max(4.0), (self.line_height - 2.0).max(4.0)),
                         );
                         editor_painter.rect_filled(pre_rect, CornerRadius::same(2), PREEDIT_BG);
                         editor_painter.galley(Pos2::new(cur_x, text_y), g_pre, PREEDIT_FG);
+                        let underline_w = (self.font_size / 10.0).clamp(1.2, 3.0);
                         editor_painter.line_segment(
                             [
                                 Pos2::new(cur_x, y + self.line_height - 2.0),
                                 Pos2::new(cur_x + pw, y + self.line_height - 2.0),
                             ],
-                            Stroke::new(1.5_f32, PREEDIT_UNDERLINE),
+                            Stroke::new(underline_w, PREEDIT_UNDERLINE),
                         );
                         cur_x += pw;
 
@@ -1871,7 +2438,7 @@ impl LzEditorApp {
                                 Pos2::new(cur_x + 2.0, y + self.line_height * 0.5),
                                 Align2::LEFT_CENTER,
                                 "↵",
-                                FontId::monospace(self.font_size - 2.0),
+                                FontId::monospace(marker_font_size),
                                 TEXT_CR_MARK,
                             );
                         }
@@ -1887,7 +2454,7 @@ impl LzEditorApp {
                                 Pos2::new(end_x + 2.0, y + self.line_height * 0.5),
                                 Align2::LEFT_CENTER,
                                 "↵",
-                                FontId::monospace(self.font_size - 2.0),
+                                FontId::monospace(marker_font_size),
                                 TEXT_CR_MARK,
                             );
                         }
@@ -1907,17 +2474,19 @@ impl LzEditorApp {
                         ),
                         Align2::LEFT_CENTER,
                         "[EOF]",
-                        FontId::monospace(self.font_size - 2.0),
+                        FontId::monospace(marker_font_size),
                         TEXT_EOF,
                     );
                 }
 
-                // Cursor rendering
+                // Cursor rendering (dynamically scaled to current font_size & line_height)
                 let caret_x = editor_rect.min.x + left_pad + cursor_px_x + preedit_px_w - scroll_x;
                 let caret_y = editor_rect.min.y + top_pad + cursor_px_y - scroll_y;
+                let caret_h = (self.line_height - 2.0).max(4.0);
+                let caret_bar_w = (self.font_size / 8.0).clamp(1.5, 4.0);
                 let cursor_rect = Rect::from_min_size(
                     Pos2::new(caret_x, caret_y + 1.0),
-                    Vec2::new(9.0, self.line_height - 2.0),
+                    Vec2::new(cursor_w, caret_h),
                 );
 
                 if editor_rect.intersects(cursor_rect) && self.inline_prompt.is_none() {
@@ -1930,22 +2499,23 @@ impl LzEditorApp {
                                 Pos2::new(caret_x, caret_y + 1.0),
                                 Pos2::new(caret_x, caret_y + self.line_height - 1.0),
                             ],
-                            Stroke::new(2.0_f32, CURSOR_BAR),
+                            Stroke::new(caret_bar_w, CURSOR_BAR),
                         );
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(450));
                 }
 
-                // Report exact IME cursor area for Fcitx5
+                // Report exact IME cursor area for Fcitx5 (tracks font_size & line_height accurately)
                 if self.inline_prompt.is_none() {
                     let preedit_start_x =
                         editor_rect.min.x + left_pad + cursor_px_x - scroll_x;
-                    let ime_x = preedit_start_x.clamp(editor_rect.min.x, editor_rect.max.x - 4.0);
-                    let ime_y =
-                        caret_y.clamp(editor_rect.min.y, editor_rect.max.y - self.line_height);
+                    let max_ime_x = (editor_rect.max.x - 4.0).max(editor_rect.min.x);
+                    let max_ime_y = (editor_rect.max.y - self.line_height).max(editor_rect.min.y);
+                    let ime_x = preedit_start_x.clamp(editor_rect.min.x, max_ime_x);
+                    let ime_y = caret_y.clamp(editor_rect.min.y, max_ime_y);
                     let ime_rect = Rect::from_min_size(
                         Pos2::new(ime_x, ime_y),
-                        Vec2::new(preedit_px_w.max(2.0), self.line_height),
+                        Vec2::new(preedit_px_w.max(cursor_w), self.line_height),
                     );
                     ctx.output_mut(|o| {
                         o.ime = Some(egui::output::IMEOutput {
@@ -2044,10 +2614,47 @@ impl LzEditorApp {
             ActivePane::Right => "filer_pane_right",
         });
 
-        let header_h = 26.0_f32;
-        let col_hdr_h = 22.0_f32;
-        let row_h = 22.0_f32;
+        // Scale all filer typography & row geometry proportionally from self.font_size
+        let scale = self.font_size / DEFAULT_FONT_SIZE;
+        let name_font_size = (14.0 * scale).clamp(9.0, 34.0);
+        let hdr_font_size = (13.0 * scale).clamp(9.0, 28.0);
+        let size_font_size = (12.5 * scale).clamp(8.5, 26.0);
+        let date_font_size = (12.0 * scale).clamp(8.5, 24.0);
+        let col_font_size = (12.0 * scale).clamp(8.5, 24.0);
+
+        let header_h = (hdr_font_size * 2.0).round().max(24.0);
+        let col_hdr_h = (col_font_size * 1.85).round().max(20.0);
+        let row_h = (name_font_size * 1.55).round().max(name_font_size + 6.0);
         let sb_w = 10.0_f32;
+
+        // Measure monospace glyph widths at the active font scale for accurate column layout & clipping
+        let (hdr_char_w, name_char_w, size_col_w, date_col_w) = ui.fonts(|f| {
+            let hc = f
+                .layout_no_wrap("M".into(), FontId::monospace(hdr_font_size), TEXT_WHITE)
+                .size()
+                .x
+                .max(hdr_font_size * 0.55);
+            let nc = f
+                .layout_no_wrap("M".into(), FontId::monospace(name_font_size), TEXT_WHITE)
+                .size()
+                .x
+                .max(name_font_size * 0.55);
+            let sc = f
+                .layout_no_wrap("999.9 M".into(), FontId::monospace(size_font_size), TEXT_WHITE)
+                .size()
+                .x
+                + 10.0;
+            let dc = f
+                .layout_no_wrap(
+                    "2026-11-23 00:00".into(),
+                    FontId::monospace(date_font_size),
+                    TEXT_DIM_CYAN,
+                )
+                .size()
+                .x
+                + 10.0;
+            (hc, nc, sc, dc)
+        });
 
         let border_color = if is_active {
             BORDER_ACTIVE_PANE
@@ -2085,29 +2692,32 @@ impl LzEditorApp {
             ActivePane::Left => "[L]",
             ActivePane::Right => "[R]",
         };
-        let max_dir_cols = ((hdr_rect.width() - 96.0) / 8.0).floor().max(12.0) as usize;
-        let dir_str = truncate_path_left(&pane.current_dir.display().to_string(), max_dir_cols);
         let entry_count = pane.entries.iter().filter(|e| !e.is_parent).count();
         let marked_count = pane.marked.len();
-
-        painter.text(
-            Pos2::new(hdr_rect.min.x + 8.0, hdr_rect.center().y),
-            Align2::LEFT_CENTER,
-            format!("{side_tag} {dir_str}"),
-            FontId::monospace(13.0),
-            if is_active { TEXT_CYAN } else { TEXT_WHITE },
-        );
-
         let right_info = if marked_count > 0 {
             format!("*{marked_count}/{entry_count}")
         } else {
             format!("{entry_count}件")
         };
+        let right_info_w = (right_info.chars().count() as f32 * hdr_char_w * 1.2).max(56.0);
+        let max_dir_cols = ((hdr_rect.width() - right_info_w - hdr_char_w * 6.0) / hdr_char_w)
+            .floor()
+            .max(8.0) as usize;
+        let dir_str = truncate_path_left(&pane.current_dir.display().to_string(), max_dir_cols);
+
+        painter.text(
+            Pos2::new(hdr_rect.min.x + 8.0, hdr_rect.center().y),
+            Align2::LEFT_CENTER,
+            format!("{side_tag} {dir_str}"),
+            FontId::monospace(hdr_font_size),
+            if is_active { TEXT_CYAN } else { TEXT_WHITE },
+        );
+
         painter.text(
             Pos2::new(hdr_rect.max.x - 8.0, hdr_rect.center().y),
             Align2::RIGHT_CENTER,
             right_info,
-            FontId::monospace(12.5),
+            FontId::monospace(size_font_size),
             if marked_count > 0 {
                 TEXT_AMBER
             } else {
@@ -2134,33 +2744,50 @@ impl LzEditorApp {
             Pos2::new(rect.max.x - sb_w - 1.0, rect.max.y - 1.0),
         );
 
-        let date_col_w = 136.0_f32;
-        let size_col_w = 82.0_f32;
+        let mark_x = list_rect.min.x + (8.0 * scale).clamp(6.0, 14.0);
+        let name_x = list_rect.min.x + (22.0 * scale).clamp(16.0, 38.0);
+        let min_name_w = (name_char_w * 12.0).max(96.0);
+        let show_date = list_rect.width() >= (name_x - list_rect.min.x) + min_name_w + size_col_w + date_col_w + 24.0;
+        let show_size = list_rect.width() >= (name_x - list_rect.min.x) + min_name_w + size_col_w + 16.0;
+
         let date_x = list_rect.max.x - 8.0;
-        let size_x = date_x - date_col_w - 8.0;
-        let name_max_w = (size_x - size_col_w - list_rect.min.x - 24.0).max(80.0);
+        let size_x = if show_date {
+            date_x - date_col_w - 8.0
+        } else {
+            list_rect.max.x - 8.0
+        };
+        let name_right_limit = if show_size {
+            size_x - size_col_w - 6.0
+        } else {
+            list_rect.max.x - 8.0
+        };
+        let name_max_w = (name_right_limit - name_x).max(60.0);
 
         painter.text(
-            Pos2::new(list_rect.min.x + 22.0, col_rect.center().y),
+            Pos2::new(name_x, col_rect.center().y),
             Align2::LEFT_CENTER,
             "名前",
-            FontId::monospace(12.0),
+            FontId::monospace(col_font_size),
             TEXT_DIM_CYAN,
         );
-        painter.text(
-            Pos2::new(size_x, col_rect.center().y),
-            Align2::RIGHT_CENTER,
-            "サイズ",
-            FontId::monospace(12.0),
-            TEXT_DIM_CYAN,
-        );
-        painter.text(
-            Pos2::new(date_x, col_rect.center().y),
-            Align2::RIGHT_CENTER,
-            "更新日時",
-            FontId::monospace(12.0),
-            TEXT_DIM_CYAN,
-        );
+        if show_size {
+            painter.text(
+                Pos2::new(size_x, col_rect.center().y),
+                Align2::RIGHT_CENTER,
+                "サイズ",
+                FontId::monospace(col_font_size),
+                TEXT_DIM_CYAN,
+            );
+        }
+        if show_date {
+            painter.text(
+                Pos2::new(date_x, col_rect.center().y),
+                Align2::RIGHT_CENTER,
+                "更新日時",
+                FontId::monospace(col_font_size),
+                TEXT_DIM_CYAN,
+            );
+        }
 
         // Interaction area for the pane
         let resp = ui.interact(list_rect, pane_id, Sense::click());
@@ -2223,6 +2850,8 @@ impl LzEditorApp {
         let last_row = ((pane.scroll_y + list_rect.height()) / row_h).ceil() as usize;
         let end_row = (last_row + 1).min(pane.entries.len());
 
+        let cursor_bar_w = (3.0 * scale).clamp(2.5, 5.0);
+
         for idx in first_row..end_row {
             let entry = &pane.entries[idx];
             let y = list_rect.min.y + idx as f32 * row_h - pane.scroll_y;
@@ -2246,7 +2875,7 @@ impl LzEditorApp {
             }
             if is_cursor && is_active_now {
                 list_painter.rect_filled(
-                    Rect::from_min_size(row_rect.min, Vec2::new(3.0, row_h)),
+                    Rect::from_min_size(row_rect.min, Vec2::new(cursor_bar_w, row_h)),
                     CornerRadius::ZERO,
                     CURSOR_BAR,
                 );
@@ -2255,10 +2884,10 @@ impl LzEditorApp {
             // Mark asterisk
             if is_marked {
                 list_painter.text(
-                    Pos2::new(list_rect.min.x + 9.0, row_rect.center().y),
+                    Pos2::new(mark_x, row_rect.center().y),
                     Align2::LEFT_CENTER,
                     "*",
-                    FontId::monospace(14.0),
+                    FontId::monospace(name_font_size),
                     TEXT_AMBER,
                 );
             }
@@ -2271,7 +2900,7 @@ impl LzEditorApp {
             } else {
                 entry.name.clone()
             };
-            let max_chars = (name_max_w / 8.5).floor().max(10.0) as usize;
+            let max_chars = (name_max_w / name_char_w).floor().max(8.0) as usize;
             let clipped_name = truncate_display_right(&display_name, max_chars);
 
             let name_color = if is_marked {
@@ -2282,40 +2911,42 @@ impl LzEditorApp {
                 TEXT_WHITE
             };
             list_painter.text(
-                Pos2::new(list_rect.min.x + 22.0, row_rect.center().y),
+                Pos2::new(name_x, row_rect.center().y),
                 Align2::LEFT_CENTER,
                 clipped_name,
-                FontId::monospace(14.0),
+                FontId::monospace(name_font_size),
                 name_color,
             );
 
             // Size column
-            let size_text = if entry.is_parent {
-                "<UP>".to_string()
-            } else if entry.is_dir {
-                "<DIR>".to_string()
-            } else {
-                format_size(entry.size)
-            };
-            list_painter.text(
-                Pos2::new(size_x, row_rect.center().y),
-                Align2::RIGHT_CENTER,
-                size_text,
-                FontId::monospace(12.5),
-                if entry.is_dir {
-                    TEXT_DIM_CYAN
+            if show_size {
+                let size_text = if entry.is_parent {
+                    "<UP>".to_string()
+                } else if entry.is_dir {
+                    "<DIR>".to_string()
                 } else {
-                    TEXT_WHITE
-                },
-            );
+                    format_size(entry.size)
+                };
+                list_painter.text(
+                    Pos2::new(size_x, row_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    size_text,
+                    FontId::monospace(size_font_size),
+                    if entry.is_dir {
+                        TEXT_DIM_CYAN
+                    } else {
+                        TEXT_WHITE
+                    },
+                );
+            }
 
             // Modified timestamp
-            if !entry.modified_str.is_empty() {
+            if show_date && !entry.modified_str.is_empty() {
                 list_painter.text(
                     Pos2::new(date_x, row_rect.center().y),
                     Align2::RIGHT_CENTER,
                     &entry.modified_str,
-                    FontId::monospace(12.0),
+                    FontId::monospace(date_font_size),
                     TEXT_DIM_CYAN,
                 );
             }
@@ -2373,7 +3004,7 @@ impl LzEditorApp {
             .show(ctx, |ui| {
                 let rows: &[(&str, &str)] = match self.mode {
                     AppMode::Editor => &[
-                        ("Ctrl+E / S / D / X", "ダイヤモンドカーソル移動 (上/左/右/下)"),
+                        ("Ctrl+E / S / D / X", "ダイヤモンドカーソル移動 (ビュー時は上下スクロール)"),
                         ("Ctrl+A / Ctrl+F", "単語単位の左・右移動"),
                         ("Ctrl+Q+S / Ctrl+Q+D", "行頭・行末移動 (Home / End も可)"),
                         ("Ctrl+Q+R / Ctrl+Q+C", "ファイル先頭・末尾移動"),
@@ -2381,6 +3012,8 @@ impl LzEditorApp {
                         ("Ctrl+G / Delete", "カーソル位置の1文字削除"),
                         ("BackSpace / Ctrl+H", "前1文字削除"),
                         ("Ctrl+W / Ctrl+Shift+W", "複数バッファ（裏画面）切替"),
+                        ("Ctrl+P / Ctrl+K+V / Alt+P", "Markdown 編集 / ビュー（プレビュー）切替"),
+                        ("Ctrl++ / Ctrl+- / Ctrl+0", "フォントサイズ拡大 / 縮小 / リセット"),
                         ("Ctrl+K+D / F10", "上書き保存 / 保存ダイアログ"),
                         ("ESC / Ctrl+K+Q / F9", "2画面ファイラーへ切替"),
                     ],
@@ -2390,6 +3023,7 @@ impl LzEditorApp {
                         ("Enter / ダブルクリック", "フォルダ移動・ファイルをバッファで開く"),
                         ("BackSpace / Ctrl+H", "親ディレクトリへ移動"),
                         ("Space", "ファイルマーク（複数選択・反転表示）"),
+                        ("Ctrl++ / Ctrl+- / Ctrl+0", "フォントサイズ拡大 / 縮小 / リセット"),
                         ("F2 / F3 / F7", "リネーム / 新規ファイル作成 / フォルダ作成"),
                         ("F4 / F5 / F6", "反対側窓へコピー / 移動 / 削除"),
                         ("F8", "ソート順切替（名前/更新/サイズ/拡張子）"),
@@ -2974,7 +3608,13 @@ impl eframe::App for LzEditorApp {
         self.render_fkey_bar(ctx);
 
         match self.mode {
-            AppMode::Editor => self.render_editor_canvas(ctx),
+            AppMode::Editor => {
+                if self.is_markdown_view() {
+                    self.render_markdown_canvas(ctx);
+                } else {
+                    self.render_editor_canvas(ctx);
+                }
+            }
             AppMode::Filer => self.render_filer_canvas(ctx),
         }
 
@@ -2987,3 +3627,175 @@ impl eframe::App for LzEditorApp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_app() -> LzEditorApp {
+        let mut buf = TextBuffer::new();
+        buf.file_path = Some(PathBuf::from("notes.md"));
+        buf.insert_text("# Title\n\n**Bold** and `code`\n");
+        LzEditorApp {
+            mode: AppMode::Editor,
+            buffers: vec![BufferSlot::new(buf)],
+            active_buf: 0,
+            filer: FilerState::new(std::env::temp_dir()),
+            prefix: PrefixKey::None,
+            status_message: String::new(),
+            ime_preedit: String::new(),
+            ime_active: false,
+            font_size: DEFAULT_FONT_SIZE,
+            line_height: calc_line_height(DEFAULT_FONT_SIZE),
+            need_scroll_to_cursor: false,
+            last_visible_lines: 24,
+            last_filer_visible_rows: 20,
+            show_help: false,
+            pending_dialog: None,
+            inline_prompt: None,
+            filer_modal: None,
+        }
+    }
+
+    #[test]
+    fn test_font_size_scaling_clamp_and_reset() {
+        let mut app = make_test_app();
+        assert_eq!(app.font_size, 16.0);
+        assert_eq!(app.line_height, 23.0);
+
+        app.zoom_in_font();
+        assert_eq!(app.font_size, 18.0);
+        assert!(app.line_height > 23.0);
+        assert!(app.need_scroll_to_cursor);
+        assert!(app.filer.left.need_scroll_to_cursor);
+        assert!(app.filer.right.need_scroll_to_cursor);
+
+        app.set_font_size(100.0);
+        assert_eq!(app.font_size, MAX_FONT_SIZE);
+        assert!(app.line_height >= MAX_FONT_SIZE + 4.0);
+
+        app.set_font_size(2.0);
+        assert_eq!(app.font_size, MIN_FONT_SIZE);
+        assert!(app.line_height >= MIN_FONT_SIZE + 4.0);
+
+        app.reset_font_size();
+        assert_eq!(app.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(app.line_height, calc_line_height(DEFAULT_FONT_SIZE));
+    }
+
+    #[test]
+    fn test_font_zoom_keys() {
+        let mut app = make_test_app();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+
+        assert!(app.handle_font_zoom_key(Key::Plus, ctrl));
+        assert_eq!(app.font_size, 18.0);
+        assert!(app.handle_font_zoom_key(Key::Equals, ctrl));
+        assert_eq!(app.font_size, 20.0);
+        assert!(app.handle_font_zoom_key(Key::Semicolon, ctrl_shift));
+        assert_eq!(app.font_size, 22.0);
+        assert!(app.handle_font_zoom_key(Key::Minus, ctrl));
+        assert_eq!(app.font_size, 20.0);
+        assert!(app.handle_font_zoom_key(Key::Num0, ctrl));
+        assert_eq!(app.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn test_markdown_view_toggle_and_cache() {
+        let mut app = make_test_app();
+        assert!(!app.is_markdown_view());
+
+        app.toggle_markdown_view();
+        assert!(app.is_markdown_view());
+        assert!(app.cur_slot().md_scroll_dirty);
+
+        app.cur_slot_mut().ensure_md_cache();
+        assert_eq!(app.cur_slot().md_blocks.len(), 2);
+
+        // Scroll clamping
+        app.cur_slot_mut().md_max_scroll_y = 200.0;
+        app.scroll_markdown_by(80.0);
+        assert_eq!(app.cur_slot().md_scroll_y, 80.0);
+        app.scroll_markdown_to_bottom();
+        assert_eq!(app.cur_slot().md_scroll_y, 200.0);
+        app.scroll_markdown_to_top();
+        assert_eq!(app.cur_slot().md_scroll_y, 0.0);
+
+        // Toggle back to Edit
+        app.toggle_markdown_view();
+        assert!(!app.is_markdown_view());
+        assert!(app.need_scroll_to_cursor);
+    }
+
+    #[test]
+    fn test_headless_render_all_modes_and_font_sizes() {
+        let mut app = make_test_app();
+        // Load real README.md content into the buffer
+        let readme = include_str!("../README.md");
+        app.cur_buf_mut().lines = readme.lines().map(String::from).collect();
+        app.cur_buf_mut().revision += 1;
+        app.ime_preedit = "にほんご".to_string();
+        app.ime_active = true;
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 680.0))),
+            ..Default::default()
+        };
+
+        for &size in &[MIN_FONT_SIZE, DEFAULT_FONT_SIZE, MAX_FONT_SIZE] {
+            app.set_font_size(size);
+
+            // 1. Editor Edit Mode (including active IME preedit & IME rect output)
+            app.mode = AppMode::Editor;
+            app.cur_slot_mut().markdown_view = false;
+            let out_edit = ctx.run(raw_input.clone(), |ctx| {
+                app.render_status_bar(ctx);
+                app.render_buffer_strip(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_editor_canvas(ctx);
+            });
+            let ime = out_edit.platform_output.ime.expect("IME output must be set in Edit mode");
+            assert!(
+                (ime.cursor_rect.height() - app.line_height).abs() < 0.01,
+                "IME cursor rect height must track line_height at {size}pt"
+            );
+
+            // 2. Markdown View Mode (IME must be disabled, content scrollable)
+            app.cur_slot_mut().markdown_view = true;
+            app.cur_slot_mut().md_scroll_dirty = true;
+            let out_md = ctx.run(raw_input.clone(), |ctx| {
+                app.render_status_bar(ctx);
+                app.render_buffer_strip(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_markdown_canvas(ctx);
+            });
+            assert!(
+                out_md.platform_output.ime.is_none(),
+                "IME should be disabled in Markdown View mode"
+            );
+            assert!(
+                app.cur_slot().md_max_scroll_y > 0.0,
+                "README.md should be scrollable in Markdown View mode at {size}pt"
+            );
+
+            // 3. 2-Pane Filer Mode
+            app.mode = AppMode::Filer;
+            let out_filer = ctx.run(raw_input.clone(), |ctx| {
+                app.render_status_bar(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_filer_canvas(ctx);
+            });
+            assert!(out_filer.platform_output.ime.is_none());
+        }
+    }
+}
+

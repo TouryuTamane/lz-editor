@@ -53,6 +53,10 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
   Press `ESC` to switch instantaneously between the editor and a dual-pane file manager (`[L]` / `[R]`) with independent directories, multi-file marking (`Space`), sorting, and file operations (copy, move, delete, rename, create file/folder).
 - **Multi-Buffer Switching / 複数バッファ（裏画面）切替**  
   Open multiple files from the filer and cycle through them smoothly with `Ctrl+W`, with per-buffer cursor & scroll memory and a buffer strip in the status area.
+- **Real-Time Font Size Scaling / リアルタイム・フォントサイズ変更 (v0.2.0)**  
+  Zoom in/out/reset (`Ctrl++` / `Ctrl+-` / `Ctrl+0`, or click `[-] 16pt [+]` in the status bar) across both the editor and 2-pane filer, with automatic line height, cursor sizing, and Fcitx5 IME position tracking.
+- **Markdown Edit / View Mode Toggle / Markdown 編集・ビュー切替 (v0.2.0)**  
+  Press `Ctrl+P`, `Ctrl+K+V`, `Alt+P`, or click `[EDIT]`/`[VIEW]` in the status bar to switch instantaneously between plain text editing and a VZ-navy-themed Markdown preview (headings, bold/italic/code, framed code blocks, lists/tasks, quotes, rules, links, and tables) while retaining keyboard scrolling, `ESC` filer switching, and `Ctrl+W` buffer switching.
 
 ---
 
@@ -62,7 +66,7 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
 
 | Key / キー | Action (EN) | 機能 (JA) |
 | :--- | :--- | :--- |
-| `Ctrl+E` / `S` / `D` / `X` | Diamond cursor Up / Left / Right / Down | ダイヤモンドカーソル移動（上・左・右・下） |
+| `Ctrl+E` / `S` / `D` / `X` | Diamond cursor Up / Left / Right / Down | ダイヤモンドカーソル移動（ビュー時は上下スクロール） |
 | `Ctrl+A` / `Ctrl+F` | Move word Left / Right (JP & ASCII aware) | 単語単位の左・右移動（日本語・英数対応） |
 | `Ctrl+Q+S` / `Ctrl+Q+D` | Line start / Line end (`Home` / `End`) | 行頭・行末移動（`Home` / `End` も可） |
 | `Ctrl+Q+R` / `Ctrl+Q+C` | Document top / bottom | ファイル先頭・末尾移動 |
@@ -70,6 +74,8 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
 | `Ctrl+G` / `Delete` | Delete character at cursor | カーソル位置の1文字削除 |
 | `BackSpace` / `Ctrl+H` | Delete previous character | 前1文字削除 |
 | `Ctrl+W` (`Ctrl+Shift+W`) | Switch next (previous) buffer | 複数バッファ（裏画面）切替 |
+| `Ctrl+P` / `Ctrl+K+V` / `Alt+P` | Toggle Markdown Edit / View mode | Markdown 編集 / ビュー（プレビュー）切替 |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom font size in / out / reset | フォントサイズ拡大・縮小・リセット |
 | `Ctrl+K+D` / `F10` | Save / Save As dialog | 上書き保存 / 名前を付けて保存 |
 | `ESC` / `Ctrl+K+Q` / `F9` | Switch to 2-Pane Filer | 2画面ファイラーへ切替 |
 | `F1` | Toggle keybinding help | キーバインドヘルプ表示 |
@@ -85,6 +91,7 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
 | `Enter` / Double-click | Enter directory or open file in buffer | フォルダ移動 / ファイルを新規バッファで開く |
 | `BackSpace` / `Ctrl+H` | Go to parent directory (`..`) | 親ディレクトリへ移動 |
 | `Space` | Toggle file mark & move down | ファイルマーク（複数選択・反転表示） |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom font size in / out / reset | フォントサイズ拡大・縮小・リセット |
 | `F2` / `F3` / `F7` | Rename / Create new file / Create folder | リネーム / 新規ファイル作成 / フォルダ作成 |
 | `F4` / `F5` / `F6` | Copy / Move (to opposite pane) / Delete | 反対側窓へコピー / 移動 / 削除 |
 | `F8` | Cycle sort order (Name / Date / Size / Ext) | ソート順切替（名前・更新・サイズ・拡張子） |
