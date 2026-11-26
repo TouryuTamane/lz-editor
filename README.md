@@ -59,6 +59,8 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
   Press `Ctrl+P`, `Ctrl+K+V`, `Alt+P`, or click `[EDIT]`/`[VIEW]` in the status bar to switch instantaneously between plain text editing and a VZ-navy-themed Markdown preview (headings, bold/italic/code, framed code blocks, lists/tasks, quotes, rules, links, and tables) while retaining keyboard scrolling, `ESC` filer switching, and `Ctrl+W` buffer switching.
 - **Compact GUI Menu Bar, Undo/Redo, Clipboard & Dynamic Title Bar / スリム GUI メニューバー・Undo/Redo・クリップボード・動的タイトル表示 (v0.2.0)**  
   Slim VZ-navy top menu bar (`ファイル` / `編集` / `ツール` / `About`) designed never to steal focus from VZ keybindings, providing Save As, Close Buffer, Undo/Redo history, Cut/Copy/Paste clipboard integration, and an About dialog. The OS window title bar updates live with the current filename, dirty state (`*`), or active 2-pane filer directory.
+- **VZ-Style Search & Replace with Live Highlights / VZ 風 検索・置換＆ハイライト表示 (v0.3.0)**  
+  Press `Ctrl+Q`→`F` (or `Ctrl+F`) to open the bottom search bar with incremental search, case-sensitivity toggle (`Aa`), and live editor match highlights (plus scrollbar hit ticks). Press `Enter` to find next, `Ctrl+L` (`Ctrl+Shift+L`) for continuous search even after closing the bar, and `Ctrl+Q`→`A` (or `Ctrl+H`) to expand the replace row for one-by-one replace (`Enter`) or atomic Replace All (`Ctrl+Enter`, revertible via Undo). Includes native GNOME Wayland Adwaita CSD window title rendering with live filename and dirty (`*`) indicators.
 
 ---
 
@@ -69,17 +71,20 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
 | Key / キー | Action (EN) | 機能 (JA) |
 | :--- | :--- | :--- |
 | `Ctrl+E` / `S` / `D` / `X` | Diamond cursor Up / Left / Right / Down | ダイヤモンドカーソル移動（ビュー時は上下スクロール） |
-| `Ctrl+A` / `Ctrl+F` | Move word Left / Right (JP & ASCII aware) | 単語単位の左・右移動（日本語・英数対応） |
+| `Ctrl+A` / `F7` / `F8` | Move word Left / Right (JP & ASCII aware) | 単語単位の左・右移動（日本語・英数対応） |
 | `Ctrl+Q+S` / `Ctrl+Q+D` | Line start / Line end (`Home` / `End`) | 行頭・行末移動（`Home` / `End` も可） |
 | `Ctrl+Q+R` / `Ctrl+Q+C` | Document top / bottom | ファイル先頭・末尾移動 |
+| `Ctrl+Q+F` / `Ctrl+F` | Open bottom search bar (`Enter`: next, `Shift+Enter`: prev) | 画面下部に検索バー表示（`Enter` で次を検索） |
+| `Ctrl+L` (`Ctrl+Shift+L`) | Repeat search next (previous) | 連続検索（次を検索 / 前を検索） |
+| `Ctrl+Q+A` / `Ctrl+H` | Open search & replace bar (1-by-1 / Replace All) | 検索・置換バー表示（1件置換・全置換） |
 | `Ctrl+Y` | Delete current line | 現在行の削除 |
 | `Ctrl+G` / `Delete` | Delete character at cursor | カーソル位置の1文字削除 |
-| `BackSpace` / `Ctrl+H` | Delete previous character | 前1文字削除 |
+| `BackSpace` | Delete previous character | 前1文字削除 |
 | `Ctrl+W` (`Ctrl+Shift+W`) | Switch next (previous) buffer | 複数バッファ（裏画面）切替 |
 | `Ctrl+P` / `Ctrl+K+V` / `Alt+P` | Toggle Markdown Edit / View mode | Markdown 編集 / ビュー（プレビュー）切替 |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom font size in / out / reset | フォントサイズ拡大・縮小・リセット |
 | `Ctrl+K+D` / `F10` | Save / Save As dialog | 上書き保存 / 名前を付けて保存 |
-| `ESC` / `Ctrl+K+Q` / `F9` | Switch to 2-Pane Filer | 2画面ファイラーへ切替 |
+| `ESC` / `Ctrl+K+Q` / `F9` | Switch to 2-Pane Filer (closes search bar first) | 2画面ファイラーへ切替（検索バー表示中は閉じる） |
 | `F1` | Toggle keybinding help | キーバインドヘルプ表示 |
 | `F2` / `F3` | New buffer / Open file dialog | 新規バッファ / ファイルを開く |
 
@@ -174,7 +179,8 @@ cp target/release/lz ./lz
 - [x] **Phase 1 (v0.1.0)**: Core VZ Editor GUI, Japanese font auto-loading, Fcitx5 inline IME, VZ diamond cursor & editing keybindings, Save/Open
 - [x] **Phase 2 (v0.1.1)**: Instant `ESC` 2-pane VZ Filer (copy/move/delete/rename/mkdir/mark/sort), `Ctrl+W` multi-buffer switching, `.deb` / `.rpm` packaging
 - [x] **v0.2.0**: Real-time font size scaling (`Ctrl++`/`-`/`0`), Markdown Edit/View mode (`Ctrl+P` / `Ctrl+K+V` / `Alt+P`), VZ-safe GUI menu bar, Undo/Redo, clipboard operations, dynamic OS window title bar
-- [ ] **Phase 3 (Planned)**: Search & replace (`Ctrl+Q+F` / `Ctrl+Q+A`), Shift_JIS / EUC-JP encoding detection & conversion, customizable config file
+- [x] **v0.3.0**: VZ-style search & replace bar (`Ctrl+Q+F` / `Ctrl+F`, `Ctrl+L`, `Ctrl+Q+A` / `Ctrl+H`) with live editor highlights, 1-by-1 replace, atomic Replace All, and native GNOME Wayland Adwaita CSD window title rendering
+- [ ] **Phase 3 (Planned)**: Shift_JIS / EUC-JP encoding detection & conversion, customizable config file
 
 ---
 

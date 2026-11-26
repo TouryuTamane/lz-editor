@@ -5,6 +5,7 @@ mod filer;
 mod fonts;
 mod icon;
 mod markdown;
+mod search;
 
 use app::LzEditorApp;
 use eframe::egui;

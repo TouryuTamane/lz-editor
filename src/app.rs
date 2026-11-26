@@ -6,6 +6,7 @@ use crate::filer::{
 };
 use crate::fonts::configure_japanese_fonts;
 use crate::markdown::{parse_markdown, render_markdown_view, MdBlock};
+use crate::search::{FindOutcome, SearchFocus, SearchState};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Event, FontId, ImeEvent, Key, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
@@ -69,6 +70,18 @@ const CURSOR_BAR: Color32 = Color32::from_rgb(120, 244, 255);
 const PREEDIT_BG: Color32 = Color32::from_rgb(28, 72, 134);
 const PREEDIT_FG: Color32 = Color32::from_rgb(255, 246, 160);
 const PREEDIT_UNDERLINE: Color32 = Color32::from_rgb(112, 236, 255);
+
+// Search & Replace Bar / Highlight Palette (PC-98 / VZ style)
+const SEARCH_BAR_BG: Color32 = Color32::from_rgb(12, 34, 78);
+const SEARCH_MATCH_BG: Color32 = Color32::from_rgb(96, 76, 18);
+const SEARCH_MATCH_BORDER: Color32 = Color32::from_rgb(196, 156, 48);
+const SEARCH_ACTIVE_BG: Color32 = Color32::from_rgb(245, 186, 48);
+const SEARCH_ACTIVE_FG: Color32 = Color32::from_rgb(8, 20, 48);
+const SEARCH_ACTIVE_BORDER: Color32 = Color32::from_rgb(255, 244, 170);
+const SEARCH_SCROLLBAR_TICK: Color32 = Color32::from_rgb(245, 196, 72);
+
+const SEARCH_FIND_INPUT_ID: &str = "lz_search_find_input";
+const SEARCH_REPLACE_INPUT_ID: &str = "lz_search_replace_input";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppMode {
@@ -175,6 +188,9 @@ enum MenuAction {
     Cut,
     Copy,
     Paste,
+    Find,
+    FindNext,
+    Replace,
     DeleteLine,
     MoveLineStart,
     MoveLineEnd,
@@ -311,6 +327,7 @@ pub struct LzEditorApp {
     pending_dialog: Option<Receiver<DialogResult>>,
     inline_prompt: Option<InlinePathPrompt>,
     filer_modal: Option<FilerModal>,
+    search: SearchState,
 }
 
 impl LzEditorApp {
@@ -323,8 +340,9 @@ impl LzEditorApp {
             o.zoom_with_keyboard = false;
         });
 
-        let mut status_message =
-            String::from("VZ互換: ^E/^S/^D/^X移動  ^Wバッファ切替  ^P MDビュー  ESCファイラー  F1ヘルプ");
+        let mut status_message = String::from(
+            "VZ互換: ^E/^S/^D/^X移動  ^Q^F検索  ^Q^A置換  ^L連続検索  ESCファイラー  F1ヘルプ",
+        );
         let mut initial_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let initial_buffer = if let Some(path) = initial_file {
@@ -354,7 +372,7 @@ impl LzEditorApp {
             TextBuffer::new()
         };
 
-        let mut app = Self {
+        Self {
             mode: AppMode::Editor,
             buffers: vec![BufferSlot::new(initial_buffer)],
             active_buf: 0,
@@ -377,9 +395,8 @@ impl LzEditorApp {
             pending_dialog: None,
             inline_prompt: None,
             filer_modal: None,
-        };
-        app.sync_window_title(&cc.egui_ctx);
-        app
+            search: SearchState::new(),
+        }
     }
 
     fn configure_visuals(ctx: &egui::Context) {
@@ -477,6 +494,8 @@ impl LzEditorApp {
         let now_view = slot.markdown_view;
         if now_view {
             slot.md_scroll_dirty = true;
+            self.search.open = false;
+            self.search.focus_target = None;
             self.status_message =
                 "Markdown ビューモード [VIEW] (^P / Alt+P / ^K^V で編集へ戻る)".to_string();
         } else {
@@ -510,6 +529,8 @@ impl LzEditorApp {
         self.prefix = PrefixKey::None;
         self.ime_preedit.clear();
         self.show_help = false;
+        self.search.open = false;
+        self.search.focus_target = None;
         self.filer.refresh_both();
         self.mode = AppMode::Filer;
         self.status_message = "2画面ファイラー (Tab/←→:窓切替  Space:マーク  Enter:開く  ESC:エディタ戻)"
@@ -918,6 +939,277 @@ impl LzEditorApp {
         }
     }
 
+    // --- VZ-Style Search & Replace (^Q^F / Ctrl+F, ^Q^A / Ctrl+H, ^L) ---
+
+    fn is_search_input_focused(&self, ctx: &egui::Context) -> bool {
+        if !self.search.open || self.mode != AppMode::Editor || self.is_markdown_view() {
+            return false;
+        }
+        self.search.focus_target.is_some()
+            || ctx.memory(|m| {
+                m.has_focus(egui::Id::new(SEARCH_FIND_INPUT_ID))
+                    || m.has_focus(egui::Id::new(SEARCH_REPLACE_INPUT_ID))
+            })
+    }
+
+    fn open_search_bar(&mut self, replace_mode: bool) {
+        self.prefix = PrefixKey::None;
+        self.ime_preedit.clear();
+        self.show_help = false;
+
+        if self.mode != AppMode::Editor {
+            self.enter_editor();
+        }
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().markdown_view = false;
+            self.need_scroll_to_cursor = true;
+        }
+
+        let was_open = self.search.open;
+        if !was_open {
+            self.search.search_origin = (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+        }
+
+        self.search.open = true;
+        self.search.replace_mode = replace_mode;
+        self.search.highlight_active = true;
+
+        if replace_mode && was_open && !self.search.query.is_empty() {
+            self.search.focus_target = Some(SearchFocus::Replace);
+        } else {
+            self.search.focus_target = Some(SearchFocus::Find);
+        }
+        self.search.select_all_on_focus = true;
+
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+
+        if replace_mode {
+            self.status_message =
+                "置換 (^Q^A / Ctrl+H): Enterで1件置換  Ctrl+Enterで全置換  ^Lで次へ  ESCで閉じる"
+                    .to_string();
+        } else {
+            self.status_message =
+                "検索 (^Q^F / Ctrl+F): Enterで次を検索  ^Lで連続検索  ESCで閉じる".to_string();
+        }
+    }
+
+    fn close_search_bar(&mut self, ctx: &egui::Context) {
+        self.search.open = false;
+        self.search.highlight_active = false;
+        self.search.focus_target = None;
+        self.search.select_all_on_focus = false;
+        ctx.memory_mut(|m| {
+            m.surrender_focus(egui::Id::new(SEARCH_FIND_INPUT_ID));
+            m.surrender_focus(egui::Id::new(SEARCH_REPLACE_INPUT_ID));
+        });
+        if !self.search.query.is_empty() {
+            self.status_message =
+                format!("検索バーを閉じました (^L で「{}」を連続検索)", self.search.query);
+        } else {
+            self.status_message = "検索バーを閉じました".to_string();
+        }
+    }
+
+    fn apply_find_outcome(&mut self, outcome: FindOutcome, is_backward: bool) -> bool {
+        match outcome {
+            FindOutcome::EmptyQuery => {
+                self.status_message = "検索文字列を入力してください".to_string();
+                false
+            }
+            FindOutcome::NotFound => {
+                self.status_message = format!("見つかりません: \"{}\"", self.search.query);
+                false
+            }
+            FindOutcome::Found {
+                index,
+                total,
+                wrapped,
+                matched,
+            } => {
+                self.cur_buf_mut().set_cursor(matched.line, matched.start_col);
+                self.need_scroll_to_cursor = true;
+                self.search.highlight_active = true;
+                let wrap_note = if wrapped {
+                    if is_backward {
+                        " [末尾から再検索]"
+                    } else {
+                        " [先頭から再検索]"
+                    }
+                } else {
+                    ""
+                };
+                self.status_message = format!(
+                    "検索 \"{}\": {}/{}件{}",
+                    self.search.query,
+                    index + 1,
+                    total,
+                    wrap_note
+                );
+                true
+            }
+        }
+    }
+
+    fn search_incremental(&mut self) {
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+        if self.search.query.is_empty() {
+            self.search.current_match = None;
+            self.status_message = "検索文字列を入力してください".to_string();
+            return;
+        }
+        let (orig_line, orig_col) = self.search.search_origin;
+        let outcome = self.search.find_at_or_after(orig_line, orig_col);
+        self.apply_find_outcome(outcome, false);
+    }
+
+    fn search_next(&mut self) {
+        if self.search.query.is_empty() {
+            self.open_search_bar(false);
+            return;
+        }
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().markdown_view = false;
+        }
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+        let (line, col) = (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+        let outcome = self.search.find_next_after(line, col);
+        if self.apply_find_outcome(outcome, false) {
+            self.search.search_origin = (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+        }
+    }
+
+    fn search_prev(&mut self) {
+        if self.search.query.is_empty() {
+            self.open_search_bar(false);
+            return;
+        }
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().markdown_view = false;
+        }
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+        let (line, col) = (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+        let outcome = self.search.find_prev_before(line, col);
+        if self.apply_find_outcome(outcome, true) {
+            self.search.search_origin = (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+        }
+    }
+
+    fn replace_current_and_next(&mut self) {
+        if self.search.query.is_empty() {
+            self.status_message = "置換対象の検索文字列を入力してください".to_string();
+            return;
+        }
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().markdown_view = false;
+        }
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+
+        if self.search.matches().is_empty() {
+            self.status_message = format!("見つかりません: \"{}\"", self.search.query);
+            return;
+        }
+
+        let (cur_line, cur_col) = (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+        let Some(hit_idx) = self.search.match_at_cursor(cur_line, cur_col) else {
+            // Cursor is not currently on a match; jump to the next match first so user sees what will be replaced
+            let outcome = self.search.find_at_or_after(cur_line, cur_col);
+            if self.apply_find_outcome(outcome, false) {
+                self.search.search_origin =
+                    (self.cur_buf().cursor_line, self.cur_buf().cursor_col);
+                self.status_message = format!(
+                    "{} — もう一度「置換」または Enter で置換します",
+                    self.status_message
+                );
+            }
+            return;
+        };
+
+        let matched = self.search.matches()[hit_idx];
+        let replacement = self.search.replacement.clone();
+        let (end_line, end_col) = self.buffers[active_idx].buffer.replace_in_line(
+            matched.line,
+            matched.start_byte,
+            matched.end_byte,
+            &replacement,
+        );
+
+        self.search.invalidate_cache();
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+        self.search.highlight_active = true;
+
+        match self.search.find_at_or_after(end_line, end_col) {
+            FindOutcome::Found {
+                index,
+                total,
+                wrapped,
+                matched: next,
+            } => {
+                self.cur_buf_mut().set_cursor(next.line, next.start_col);
+                self.search.search_origin = (next.line, next.start_col);
+                self.need_scroll_to_cursor = true;
+                let wrap_note = if wrapped { " [先頭へ折り返し]" } else { "" };
+                self.status_message = format!(
+                    "1件置換しました (次: {}/{}件){}",
+                    index + 1,
+                    total,
+                    wrap_note
+                );
+            }
+            _ => {
+                self.need_scroll_to_cursor = true;
+                self.status_message = "1件置換しました（残りの一致はありません）".to_string();
+            }
+        }
+    }
+
+    fn replace_all(&mut self) {
+        if self.search.query.is_empty() {
+            self.status_message = "置換対象の検索文字列を入力してください".to_string();
+            return;
+        }
+        if self.cur_slot().markdown_view {
+            self.cur_slot_mut().markdown_view = false;
+        }
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+
+        let ranges: Vec<(usize, usize, usize)> = self
+            .search
+            .matches()
+            .iter()
+            .map(|m| (m.line, m.start_byte, m.end_byte))
+            .collect();
+
+        if ranges.is_empty() {
+            self.status_message = format!("見つかりません: \"{}\"", self.search.query);
+            return;
+        }
+
+        let replacement = self.search.replacement.clone();
+        let count = self.buffers[active_idx]
+            .buffer
+            .replace_all_matches(&ranges, &replacement);
+
+        self.search.invalidate_cache();
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+        self.need_scroll_to_cursor = true;
+        self.status_message =
+            format!("全置換完了: {count}件を置換しました (編集メニューから元に戻せます)");
+    }
+
     // --- Menu Bar Model & Actions ---
 
     fn build_menu_entries(&self, menu: TopMenu) -> Vec<MenuEntry> {
@@ -1011,6 +1303,25 @@ impl LzEditorApp {
                     shortcut: "Ctrl+V",
                     action: MenuAction::Paste,
                     enabled: can_edit,
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "検索...",
+                    shortcut: "^Q^F / Ctrl+F",
+                    action: MenuAction::Find,
+                    enabled: in_editor,
+                },
+                MenuEntry::Item {
+                    label: "次を検索 (連続検索)",
+                    shortcut: "Ctrl+L",
+                    action: MenuAction::FindNext,
+                    enabled: in_editor,
+                },
+                MenuEntry::Item {
+                    label: "置換...",
+                    shortcut: "^Q^A / Ctrl+H",
+                    action: MenuAction::Replace,
+                    enabled: in_editor,
                 },
                 MenuEntry::Separator,
                 MenuEntry::Item {
@@ -1145,6 +1456,9 @@ impl LzEditorApp {
             MenuAction::Cut => self.menu_cut(ctx),
             MenuAction::Copy => self.menu_copy(ctx),
             MenuAction::Paste => self.menu_paste(),
+            MenuAction::Find => self.open_search_bar(false),
+            MenuAction::FindNext => self.search_next(),
+            MenuAction::Replace => self.open_search_bar(true),
             MenuAction::DeleteLine => self.execute_editor_action(EditorAction::DeleteLine),
             MenuAction::MoveLineStart => self.execute_editor_action(EditorAction::MoveLineStart),
             MenuAction::MoveLineEnd => self.execute_editor_action(EditorAction::MoveLineEnd),
@@ -1408,9 +1722,138 @@ impl LzEditorApp {
             self.handle_menu_events(ctx);
             return;
         }
+        if self.mode == AppMode::Editor && self.is_search_input_focused(ctx) {
+            self.handle_search_bar_shortcuts(ctx);
+            return;
+        }
         match self.mode {
             AppMode::Editor => self.handle_editor_events(ctx),
             AppMode::Filer => self.handle_filer_events(ctx),
+        }
+    }
+
+    fn handle_search_bar_shortcuts(&mut self, ctx: &egui::Context) {
+        let has_ime_preedit = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, Event::Ime(ImeEvent::Preedit(s)) if !s.is_empty()))
+        });
+        if has_ime_preedit {
+            return;
+        }
+
+        // ESC closes the search/replace bar and returns focus to editor (does NOT enter Filer)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            if self.prefix != PrefixKey::None {
+                self.prefix = PrefixKey::None;
+                self.status_message = "コマンドをキャンセルしました".to_string();
+            } else {
+                self.close_search_bar(ctx);
+            }
+            return;
+        }
+
+        // Handle two-stroke ^Q+F / ^Q+A even while the search bar is focused
+        if self.prefix == PrefixKey::CtrlQ {
+            let pressed_key = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    Event::Key {
+                        key, pressed: true, ..
+                    } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(key) = pressed_key {
+                self.prefix = PrefixKey::None;
+                // Consume both key and any accompanying Text event so 'f'/'a' is not typed into input
+                ctx.input_mut(|i| {
+                    i.events
+                        .retain(|e| !matches!(e, Event::Key { pressed: true, .. } | Event::Text(_)));
+                });
+                match key {
+                    Key::F => self.open_search_bar(false),
+                    Key::A => self.open_search_bar(true),
+                    _ => {}
+                }
+                return;
+            }
+        }
+
+        // Ctrl+Q prefix while in search bar
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::Q)) {
+            self.prefix = PrefixKey::CtrlQ;
+            self.status_message = "^Q  [F:検索  A:置換  ESC:取消]".to_string();
+            return;
+        }
+
+        // Ctrl+Shift+L: Find Previous
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::L)
+        }) {
+            self.search_prev();
+            return;
+        }
+
+        // Ctrl+L: Continuous Find Next (連続検索)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::L)) {
+            self.search_next();
+            return;
+        }
+
+        // Ctrl+F: focus search box
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F)) {
+            self.open_search_bar(false);
+            return;
+        }
+
+        // Ctrl+H: open/switch to replace mode and focus replace box
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H)) {
+            self.open_search_bar(true);
+            return;
+        }
+
+        // Ctrl+Enter in replace mode: Replace All
+        if self.search.replace_mode
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::Enter))
+        {
+            self.replace_all();
+            return;
+        }
+
+        // Tab / Shift+Tab in replace mode: toggle cleanly between Find and Replace inputs
+        if self.search.replace_mode {
+            let tab_pressed = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::Tab)
+                    || i.consume_key(egui::Modifiers::SHIFT, Key::Tab)
+            });
+            if tab_pressed {
+                let find_focused = ctx.memory(|m| m.has_focus(egui::Id::new(SEARCH_FIND_INPUT_ID)));
+                self.search.focus_target = Some(if find_focused {
+                    SearchFocus::Replace
+                } else {
+                    SearchFocus::Find
+                });
+                self.search.select_all_on_focus = true;
+                return;
+            }
+        }
+
+        // Allow font size zoom shortcuts even while the search bar is focused
+        let zoom_key = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if (modifiers.ctrl || modifiers.command) && !modifiers.alt => {
+                    Some((*key, *modifiers))
+                }
+                _ => None,
+            })
+        });
+        if let Some((key, mods)) = zoom_key {
+            self.handle_font_zoom_key(key, mods);
         }
     }
 
@@ -1515,6 +1958,14 @@ impl LzEditorApp {
                             suppress_text_this_frame = true;
                             self.prefix = PrefixKey::None;
                             match key {
+                                Key::F => {
+                                    self.open_search_bar(false);
+                                    return;
+                                }
+                                Key::A => {
+                                    self.open_search_bar(true);
+                                    return;
+                                }
                                 Key::S => {
                                     if !in_md_view {
                                         self.cur_buf_mut().move_line_start();
@@ -1605,11 +2056,13 @@ impl LzEditorApp {
                         continue;
                     }
 
-                    // 3. ESC: instant switch to 2-pane Filer! (Closes help first if open)
+                    // 3. ESC: close help or search bar first; otherwise switch immediately to 2-pane Filer!
                     if key == Key::Escape {
                         suppress_text_this_frame = true;
                         if self.show_help {
                             self.show_help = false;
+                        } else if self.search.open {
+                            self.close_search_bar(ctx);
                         } else {
                             self.enter_filer();
                             return;
@@ -1671,7 +2124,7 @@ impl LzEditorApp {
                                 }
                                 true
                             }
-                            // Word left / right: Ctrl+A / Ctrl+F
+                            // Word left: Ctrl+A (F7/F8 also move word left/right)
                             Key::A => {
                                 if !in_md_view {
                                     self.cur_buf_mut().move_word_left();
@@ -1679,10 +2132,22 @@ impl LzEditorApp {
                                 }
                                 true
                             }
+                            // Search bar: Ctrl+F (same as Ctrl+Q -> F)
                             Key::F => {
-                                if !in_md_view {
-                                    self.cur_buf_mut().move_word_right();
-                                    self.need_scroll_to_cursor = true;
+                                self.open_search_bar(false);
+                                return;
+                            }
+                            // Search & Replace bar: Ctrl+H (same as Ctrl+Q -> A)
+                            Key::H => {
+                                self.open_search_bar(true);
+                                return;
+                            }
+                            // Continuous Search (連続検索): Ctrl+L (next) / Ctrl+Shift+L (prev)
+                            Key::L => {
+                                if modifiers.shift {
+                                    self.search_prev();
+                                } else {
+                                    self.search_next();
                                 }
                                 true
                             }
@@ -1712,14 +2177,6 @@ impl LzEditorApp {
                                 }
                                 true
                             }
-                            // BackSpace: Ctrl+H
-                            Key::H => {
-                                if !in_md_view {
-                                    self.cur_buf_mut().backspace();
-                                    self.need_scroll_to_cursor = true;
-                                }
-                                true
-                            }
                             // Enter: Ctrl+M
                             Key::M => {
                                 if !in_md_view {
@@ -1732,7 +2189,8 @@ impl LzEditorApp {
                             Key::Q => {
                                 self.prefix = PrefixKey::CtrlQ;
                                 self.status_message =
-                                    "^Q  [S:行頭  D:行末  R:先頭  C:末尾  ESC:取消]".to_string();
+                                    "^Q  [F:検索  A:置換  S:行頭  D:行末  R:先頭  C:末尾  ESC:取消]"
+                                        .to_string();
                                 true
                             }
                             Key::K => {
@@ -2934,6 +3392,400 @@ impl LzEditorApp {
         response.clicked()
     }
 
+    // --- VZ-Style Bottom Search & Replace Bar (^Q^F / Ctrl+F, ^Q^A / Ctrl+H) ---
+
+    fn render_search_bar(&mut self, ctx: &egui::Context) {
+        if self.mode != AppMode::Editor || self.is_markdown_view() || !self.search.open {
+            return;
+        }
+
+        let active_idx = self.active_buf;
+        self.search
+            .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
+
+        let match_total = self.search.matches().len();
+        let current_match_idx = self.search.current_match;
+        let is_replace = self.search.replace_mode;
+        let case_sensitive = self.search.case_sensitive;
+        let query_empty = self.search.query.is_empty();
+
+        let mut find_changed = false;
+        let mut trigger_next = false;
+        let mut trigger_prev = false;
+        let mut trigger_replace_one = false;
+        let mut trigger_replace_all = false;
+        let mut trigger_toggle_case = false;
+        let mut trigger_toggle_replace = false;
+        let mut trigger_close = false;
+
+        let panel_border = if is_replace { TEXT_AMBER } else { TEXT_CYAN };
+
+        egui::TopBottomPanel::bottom("search_replace_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(SEARCH_BAR_BG)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .stroke(Stroke::new(1.5_f32, panel_border)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
+                let input_w = (ui.available_width() * 0.30).clamp(160.0, 320.0);
+
+                // Row 1: Search input + match count + Prev/Next + Case + Replace toggle + Close
+                ui.horizontal(|ui| {
+                    // VZ Mode Badge
+                    let (badge_text, badge_bg) = if is_replace {
+                        ("置換 ^Q^A", STATUS_BADGE_FILER_BG)
+                    } else {
+                        ("検索 ^Q^F", STATUS_BADGE_BG)
+                    };
+                    egui::Frame::NONE
+                        .fill(badge_bg)
+                        .corner_radius(CornerRadius::same(2))
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(badge_text)
+                                    .font(FontId::monospace(12.0))
+                                    .strong()
+                                    .color(STATUS_BADGE_FG),
+                            );
+                        });
+
+                    ui.label(
+                        egui::RichText::new("検索:")
+                            .font(FontId::monospace(13.0))
+                            .color(TEXT_CYAN),
+                    );
+
+                    let find_id = egui::Id::new(SEARCH_FIND_INPUT_ID);
+                    let mut find_out = egui::TextEdit::singleline(&mut self.search.query)
+                        .id(find_id)
+                        .hint_text("検索文字列を入力...")
+                        .font(FontId::monospace(13.5))
+                        .text_color(TEXT_WHITE)
+                        .desired_width(input_w)
+                        .show(ui);
+                    let find_resp = find_out.response;
+
+                    if self.search.focus_target == Some(SearchFocus::Find) {
+                        find_resp.request_focus();
+                        if self.search.select_all_on_focus {
+                            let len = self.search.query.chars().count();
+                            find_out
+                                .state
+                                .cursor
+                                .set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(len),
+                                )));
+                            find_out.state.store(ctx, find_id);
+                        }
+                        self.search.focus_target = None;
+                        self.search.select_all_on_focus = false;
+                    }
+
+                    if find_resp.changed() {
+                        find_changed = true;
+                    }
+                    if find_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        if ui.input(|i| i.modifiers.shift) {
+                            trigger_prev = true;
+                        } else {
+                            trigger_next = true;
+                        }
+                        find_resp.request_focus();
+                    }
+
+                    // Match count indicator
+                    let (count_text, count_color) = if query_empty {
+                        ("  -  ".to_string(), TEXT_DIM_CYAN)
+                    } else if match_total == 0 {
+                        ("0件".to_string(), TEXT_AMBER)
+                    } else if let Some(idx) = current_match_idx {
+                        (format!("{}/{}件", idx + 1, match_total), TEXT_CYAN)
+                    } else {
+                        (format!("{match_total}件"), TEXT_CYAN)
+                    };
+                    egui::Frame::NONE
+                        .fill(BG_NAVY)
+                        .stroke(Stroke::new(1.0_f32, BORDER_BLUE))
+                        .corner_radius(CornerRadius::same(2))
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(count_text)
+                                    .font(FontId::monospace(12.5))
+                                    .strong()
+                                    .color(count_color),
+                            );
+                        });
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("前へ")
+                                    .font(FontId::monospace(12.5))
+                                    .color(TEXT_WHITE),
+                            )
+                            .fill(FKEY_BTN_BG)
+                            .stroke(Stroke::new(1.0_f32, BORDER_BLUE))
+                            .corner_radius(CornerRadius::same(2)),
+                        )
+                        .on_hover_text("前を検索 (Shift+Enter / Ctrl+Shift+L)")
+                        .clicked()
+                    {
+                        trigger_prev = true;
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("次へ")
+                                    .font(FontId::monospace(12.5))
+                                    .strong()
+                                    .color(TEXT_CYAN),
+                            )
+                            .fill(FKEY_BTN_BG)
+                            .stroke(Stroke::new(1.0_f32, TEXT_CYAN))
+                            .corner_radius(CornerRadius::same(2)),
+                        )
+                        .on_hover_text("次を検索 (Enter / Ctrl+L)")
+                        .clicked()
+                    {
+                        trigger_next = true;
+                    }
+
+                    // Case-sensitive toggle [Aa]
+                    let (aa_fill, aa_fg, aa_stroke) = if case_sensitive {
+                        (STATUS_BADGE_FILER_BG, STATUS_BADGE_FG, TEXT_AMBER)
+                    } else {
+                        (BG_TAB_INACTIVE, TEXT_DIM_CYAN, BORDER_BLUE)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Aa")
+                                    .font(FontId::monospace(12.5))
+                                    .strong()
+                                    .color(aa_fg),
+                            )
+                            .fill(aa_fill)
+                            .stroke(Stroke::new(1.0_f32, aa_stroke))
+                            .corner_radius(CornerRadius::same(2)),
+                        )
+                        .on_hover_text(if case_sensitive {
+                            "大文字・小文字を区別: ON"
+                        } else {
+                            "大文字・小文字を区別: OFF"
+                        })
+                        .clicked()
+                    {
+                        trigger_toggle_case = true;
+                    }
+
+                    // Toggle replace row button
+                    let rep_toggle_label = if is_replace { "置換▲" } else { "置換▼" };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(rep_toggle_label)
+                                    .font(FontId::monospace(12.0))
+                                    .color(if is_replace { TEXT_AMBER } else { TEXT_WHITE }),
+                            )
+                            .fill(BG_TAB_INACTIVE)
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if is_replace { TEXT_AMBER } else { BORDER_BLUE },
+                            ))
+                            .corner_radius(CornerRadius::same(2)),
+                        )
+                        .on_hover_text("置換欄を開閉 (^Q^A / Ctrl+H)")
+                        .clicked()
+                    {
+                        trigger_toggle_replace = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("×")
+                                        .font(FontId::monospace(13.0))
+                                        .strong()
+                                        .color(TEXT_WHITE),
+                                )
+                                .fill(BG_TAB_INACTIVE)
+                                .stroke(Stroke::new(1.0_f32, BORDER_BLUE))
+                                .corner_radius(CornerRadius::same(2)),
+                            )
+                            .on_hover_text("検索バーを閉じる (ESC)")
+                            .clicked()
+                        {
+                            trigger_close = true;
+                        }
+
+                        if !is_replace && ui.available_width() > 170.0 {
+                            ui.label(
+                                egui::RichText::new("Enter:次  ^L:連続検索  ESC:閉")
+                                    .font(FontId::monospace(11.5))
+                                    .color(TEXT_DIM_CYAN),
+                            );
+                        }
+                    });
+                });
+
+                // Row 2: Replace input + 1件置換 + 全置換 (shown in Replace mode)
+                if is_replace {
+                    ui.horizontal(|ui| {
+                        // Align under the mode badge
+                        egui::Frame::NONE
+                            .fill(BG_NAVY)
+                            .stroke(Stroke::new(1.0_f32, GUTTER_SEP))
+                            .corner_radius(CornerRadius::same(2))
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Tab:欄切替")
+                                        .font(FontId::monospace(11.5))
+                                        .color(TEXT_DIM_CYAN),
+                                );
+                            });
+
+                        ui.label(
+                            egui::RichText::new("置換:")
+                                .font(FontId::monospace(13.0))
+                                .color(TEXT_AMBER),
+                        );
+
+                        let rep_id = egui::Id::new(SEARCH_REPLACE_INPUT_ID);
+                        let mut rep_out =
+                            egui::TextEdit::singleline(&mut self.search.replacement)
+                                .id(rep_id)
+                                .hint_text("置換後の文字列 (空欄で削除)...")
+                                .font(FontId::monospace(13.5))
+                                .text_color(TEXT_WHITE)
+                                .desired_width(input_w)
+                                .show(ui);
+                        let rep_resp = rep_out.response;
+
+                        if self.search.focus_target == Some(SearchFocus::Replace) {
+                            rep_resp.request_focus();
+                            if self.search.select_all_on_focus {
+                                let len = self.search.replacement.chars().count();
+                                rep_out.state.cursor.set_char_range(Some(
+                                    egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(0),
+                                        egui::text::CCursor::new(len),
+                                    ),
+                                ));
+                                rep_out.state.store(ctx, rep_id);
+                            }
+                            self.search.focus_target = None;
+                            self.search.select_all_on_focus = false;
+                        }
+
+                        if rep_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                                trigger_replace_all = true;
+                            } else {
+                                trigger_replace_one = true;
+                            }
+                            rep_resp.request_focus();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !query_empty && match_total > 0,
+                                egui::Button::new(
+                                    egui::RichText::new("1件置換")
+                                        .font(FontId::monospace(12.5))
+                                        .strong()
+                                        .color(TEXT_AMBER),
+                                )
+                                .fill(FKEY_BTN_BG)
+                                .stroke(Stroke::new(1.0_f32, TEXT_AMBER))
+                                .corner_radius(CornerRadius::same(2)),
+                            )
+                            .on_hover_text("現在の一致を置換して次へ (Enter)")
+                            .clicked()
+                        {
+                            trigger_replace_one = true;
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !query_empty && match_total > 0,
+                                egui::Button::new(
+                                    egui::RichText::new("全置換")
+                                        .font(FontId::monospace(12.5))
+                                        .strong()
+                                        .color(STATUS_BADGE_FG),
+                                )
+                                .fill(STATUS_BADGE_FILER_BG)
+                                .stroke(Stroke::new(1.0_f32, TEXT_AMBER))
+                                .corner_radius(CornerRadius::same(2)),
+                            )
+                            .on_hover_text("すべての一致を一括置換 (Ctrl+Enter)")
+                            .clicked()
+                        {
+                            trigger_replace_all = true;
+                        }
+
+                        if ui.available_width() > 170.0 {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Enter:1件置換  ^Enter:全置換  ^L:次へ")
+                                            .font(FontId::monospace(11.5))
+                                            .color(TEXT_DIM_CYAN),
+                                    );
+                                },
+                            );
+                        }
+                    });
+                }
+            });
+
+        if trigger_close {
+            self.close_search_bar(ctx);
+            return;
+        }
+        if trigger_toggle_case {
+            self.search.case_sensitive = !self.search.case_sensitive;
+            self.search.invalidate_cache();
+            self.search_incremental();
+        }
+        if trigger_toggle_replace {
+            self.search.replace_mode = !self.search.replace_mode;
+            if self.search.replace_mode {
+                self.search.focus_target = Some(if self.search.query.is_empty() {
+                    SearchFocus::Find
+                } else {
+                    SearchFocus::Replace
+                });
+                self.search.select_all_on_focus = true;
+            } else {
+                self.search.focus_target = Some(SearchFocus::Find);
+            }
+        }
+        if find_changed {
+            self.search.invalidate_cache();
+            self.search_incremental();
+        }
+        if trigger_prev {
+            self.search_prev();
+        } else if trigger_next {
+            self.search_next();
+        }
+        if trigger_replace_one {
+            self.replace_current_and_next();
+        } else if trigger_replace_all {
+            self.replace_all();
+        }
+    }
+
     // --- Main Center View (Editor, Markdown View, or 2-Pane Filer) ---
 
     fn render_markdown_canvas(&mut self, ctx: &egui::Context) {
@@ -3130,8 +3982,23 @@ impl LzEditorApp {
                             });
                             self.prefix = PrefixKey::None;
                             self.cur_buf_mut().set_cursor(target_line, target_col);
+                            if self.search.open {
+                                ctx.memory_mut(|m| {
+                                    m.surrender_focus(egui::Id::new(SEARCH_FIND_INPUT_ID));
+                                    m.surrender_focus(egui::Id::new(SEARCH_REPLACE_INPUT_ID));
+                                });
+                            }
                         }
                     }
+                }
+
+                // Refresh cached search matches if highlights are active
+                let show_search_highlights =
+                    self.search.highlight_active && !self.search.query.is_empty();
+                if show_search_highlights {
+                    let active_idx = self.active_buf;
+                    self.search
+                        .ensure_matches(active_idx, &self.buffers[active_idx].buffer);
                 }
 
                 // Paint background & gutter
@@ -3160,6 +4027,7 @@ impl LzEditorApp {
                 let gutter_painter = ui.painter_at(gutter_rect);
                 let cur_line_now = self.cur_buf().cursor_line;
                 let cur_col_now = self.cur_buf().cursor_col;
+                let active_match_idx = self.search.current_match;
 
                 for line_idx in first_line..end_line {
                     let y = editor_rect.min.y + top_pad + line_idx as f32 * self.line_height
@@ -3190,6 +4058,73 @@ impl LzEditorApp {
                     let text_origin_x = editor_rect.min.x + left_pad - scroll_x;
                     let text_y = y + (self.line_height - self.font_size) * 0.42;
                     let line = &self.cur_buf().lines[line_idx];
+
+                    // Pre-compute match highlight rectangles on this line & paint non-active backgrounds
+                    let mut active_match_overlay: Option<(Pos2, Rect, String)> = None;
+                    if show_search_highlights {
+                        let (base_idx, line_matches) = self.search.matches_on_line(line_idx);
+                        if !line_matches.is_empty() {
+                            let ime_shift_byte = if is_current && !self.ime_preedit.is_empty() {
+                                Some(char_to_byte_idx(line, cur_col_now))
+                            } else {
+                                None
+                            };
+                            for (offset, m) in line_matches.iter().enumerate() {
+                                if m.end_byte > line.len()
+                                    || !line.is_char_boundary(m.start_byte)
+                                    || !line.is_char_boundary(m.end_byte)
+                                {
+                                    continue;
+                                }
+                                let prefix_disp = expand_tabs_for_display(&line[..m.start_byte]);
+                                let match_disp =
+                                    expand_tabs_for_display(&line[m.start_byte..m.end_byte]);
+                                let (prefix_w, match_w) = ui.fonts(|f| {
+                                    let pw = if prefix_disp.is_empty() {
+                                        0.0
+                                    } else {
+                                        f.layout_no_wrap(
+                                            prefix_disp.clone(),
+                                            font_id.clone(),
+                                            TEXT_WHITE,
+                                        )
+                                        .size()
+                                        .x
+                                    };
+                                    let mw = f
+                                        .layout_no_wrap(
+                                            match_disp.clone(),
+                                            font_id.clone(),
+                                            TEXT_WHITE,
+                                        )
+                                        .size()
+                                        .x;
+                                    (pw, mw)
+                                });
+                                let extra_x = match ime_shift_byte {
+                                    Some(bp) if m.start_byte >= bp => preedit_px_w,
+                                    _ => 0.0,
+                                };
+                                let hx = text_origin_x + prefix_w + extra_x;
+                                let hrect = Rect::from_min_size(
+                                    Pos2::new(hx, y + 1.0),
+                                    Vec2::new(match_w.max(4.0), (self.line_height - 2.0).max(4.0)),
+                                );
+                                if Some(base_idx + offset) == active_match_idx {
+                                    active_match_overlay =
+                                        Some((Pos2::new(hx, text_y), hrect, match_disp));
+                                } else {
+                                    editor_painter.rect(
+                                        hrect,
+                                        CornerRadius::same(2),
+                                        SEARCH_MATCH_BG,
+                                        Stroke::new(1.0_f32, SEARCH_MATCH_BORDER),
+                                        StrokeKind::Inside,
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     if is_current && !self.ime_preedit.is_empty() {
                         let byte_pos = char_to_byte_idx(line, cur_col_now);
@@ -3267,6 +4202,23 @@ impl LzEditorApp {
                             );
                         }
                     }
+
+                    // Paint active search match in crisp inverted PC-98 amber on top of the line
+                    if let Some((text_pos, hrect, match_disp)) = active_match_overlay {
+                        editor_painter.rect(
+                            hrect,
+                            CornerRadius::same(2),
+                            SEARCH_ACTIVE_BG,
+                            Stroke::new(1.5_f32, SEARCH_ACTIVE_BORDER),
+                            StrokeKind::Inside,
+                        );
+                        let g_active = editor_painter.layout_no_wrap(
+                            match_disp,
+                            font_id.clone(),
+                            SEARCH_ACTIVE_FG,
+                        );
+                        editor_painter.galley(text_pos, g_active, SEARCH_ACTIVE_FG);
+                    }
                 }
 
                 // [EOF] marker
@@ -3297,11 +4249,16 @@ impl LzEditorApp {
                     Vec2::new(cursor_w, caret_h),
                 );
 
+                let search_focused = self.is_search_input_focused(ctx);
+
                 if editor_rect.intersects(cursor_rect) && self.inline_prompt.is_none() {
                     let t = ctx.input(|i| i.time);
-                    let blink_on = !self.ime_preedit.is_empty() || ((t * 1.8) as u64 % 2 == 0);
+                    let blink_on =
+                        search_focused || !self.ime_preedit.is_empty() || ((t * 1.8) as u64 % 2 == 0);
                     if blink_on {
-                        editor_painter.rect_filled(cursor_rect, CornerRadius::ZERO, CURSOR_FILL);
+                        if !search_focused {
+                            editor_painter.rect_filled(cursor_rect, CornerRadius::ZERO, CURSOR_FILL);
+                        }
                         editor_painter.line_segment(
                             [
                                 Pos2::new(caret_x, caret_y + 1.0),
@@ -3310,14 +4267,18 @@ impl LzEditorApp {
                             Stroke::new(caret_bar_w, CURSOR_BAR),
                         );
                     }
-                    ctx.request_repaint_after(std::time::Duration::from_millis(450));
+                    if !search_focused {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(450));
+                    }
                 }
 
-                // Report exact IME cursor area for Fcitx5 (tracks font_size & line_height accurately)
+                // Report exact IME cursor area for Fcitx5 (tracks font_size & line_height accurately).
+                // Skip when a search/replace input has focus so egui::TextEdit manages IME cleanly.
                 if self.inline_prompt.is_none()
                     && self.filer_modal.is_none()
                     && self.open_menu.is_none()
                     && !self.show_about
+                    && !search_focused
                 {
                     let preedit_start_x =
                         editor_rect.min.x + left_pad + cursor_px_x - scroll_x;
@@ -3362,6 +4323,25 @@ impl LzEditorApp {
                                 ((pos.y - sb_rect.min.y - thumb_h * 0.5) / track_h).clamp(0.0, 1.0);
                             scroll_y = norm * max_scroll_y;
                         }
+                    }
+                }
+
+                // Paint amber search-hit tick marks along the vertical scrollbar
+                if show_search_highlights && !self.search.matches().is_empty() && total_lines > 0 {
+                    let mut last_tick_line: Option<usize> = None;
+                    let denom = total_lines.max(1) as f32;
+                    for m in self.search.matches() {
+                        if last_tick_line == Some(m.line) {
+                            continue;
+                        }
+                        last_tick_line = Some(m.line);
+                        let norm = (m.line as f32 + 0.5) / denom;
+                        let ty = sb_rect.min.y + norm * sb_rect.height();
+                        let tick_rect = Rect::from_min_size(
+                            Pos2::new(sb_rect.min.x + 1.0, (ty - 1.0).clamp(sb_rect.min.y, sb_rect.max.y - 2.0)),
+                            Vec2::new(scrollbar_w - 2.0, 2.0),
+                        );
+                        painter.rect_filled(tick_rect, CornerRadius::ZERO, SEARCH_SCROLLBAR_TICK);
                     }
                 }
 
@@ -3817,17 +4797,20 @@ impl LzEditorApp {
                 let rows: &[(&str, &str)] = match self.mode {
                     AppMode::Editor => &[
                         ("Ctrl+E / S / D / X", "ダイヤモンドカーソル移動 (ビュー時は上下スクロール)"),
-                        ("Ctrl+A / Ctrl+F", "単語単位の左・右移動"),
+                        ("Ctrl+A / F7 / F8", "単語単位の左・右移動"),
                         ("Ctrl+Q+S / Ctrl+Q+D", "行頭・行末移動 (Home / End も可)"),
                         ("Ctrl+Q+R / Ctrl+Q+C", "ファイル先頭・末尾移動"),
+                        ("Ctrl+Q+F / Ctrl+F", "検索バーを表示 (Enterで次を検索 / Shift+Enterで前)"),
+                        ("Ctrl+L / Ctrl+Shift+L", "連続検索 (次を検索 / 前を検索)"),
+                        ("Ctrl+Q+A / Ctrl+H", "検索・置換バーを表示 (1件置換 / 全置換)"),
                         ("Ctrl+Y", "現在行の削除"),
                         ("Ctrl+G / Delete", "カーソル位置の1文字削除"),
-                        ("BackSpace / Ctrl+H", "前1文字削除"),
+                        ("BackSpace", "前1文字削除"),
                         ("Ctrl+W / Ctrl+Shift+W", "複数バッファ（裏画面）切替"),
                         ("Ctrl+P / Ctrl+K+V / Alt+P", "Markdown 編集 / ビュー（プレビュー）切替"),
                         ("Ctrl++ / Ctrl+- / Ctrl+0", "フォントサイズ拡大 / 縮小 / リセット"),
                         ("Ctrl+K+D / F10", "上書き保存 / 保存ダイアログ"),
-                        ("ESC / Ctrl+K+Q / F9", "2画面ファイラーへ切替"),
+                        ("ESC / Ctrl+K+Q / F9", "2画面ファイラーへ切替 (検索バー表示中は閉じる)"),
                     ],
                     AppMode::Filer => &[
                         ("Ctrl+E / X (↑ / ↓)", "ファイルカーソル移動"),
@@ -4615,6 +5598,7 @@ impl eframe::App for LzEditorApp {
         self.render_status_bar(ctx);
         self.render_buffer_strip(ctx);
         self.render_fkey_bar(ctx);
+        self.render_search_bar(ctx);
 
         match self.mode {
             AppMode::Editor => {
@@ -4672,6 +5656,7 @@ mod tests {
             pending_dialog: None,
             inline_prompt: None,
             filer_modal: None,
+            search: SearchState::new(),
         }
     }
 
@@ -4970,6 +5955,330 @@ mod tests {
             app.render_about_dialog(ctx);
         });
     }
+
+    #[test]
+    fn test_vz_search_keybindings_and_continuous_search() {
+        let mut app = make_test_app();
+        app.cur_buf_mut().lines = vec![
+            "alpha beta alpha".to_string(),
+            "日本語 alpha テスト".to_string(),
+            "ALPHA end".to_string(),
+        ];
+        app.cur_buf_mut().revision += 1;
+        app.cur_buf_mut().set_cursor(0, 0);
+
+        let ctx = egui::Context::default();
+        let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 680.0)));
+        let run_frame = |app: &mut LzEditorApp, events: Vec<Event>| {
+            let raw = egui::RawInput {
+                screen_rect: screen,
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                app.handle_events(ctx);
+                app.render_menu_bar(ctx);
+                app.render_status_bar(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_search_bar(ctx);
+                app.render_editor_canvas(ctx);
+            });
+        };
+
+        // 1. Ctrl+Q -> F (with plain 'f' text event) opens search bar cleanly without leaking 'f'
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Q,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(app.prefix, PrefixKey::CtrlQ);
+
+        run_frame(
+            &mut app,
+            vec![
+                Event::Key {
+                    key: Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                Event::Text("f".to_string()),
+            ],
+        );
+        assert!(app.search.open);
+        assert!(!app.search.replace_mode);
+        assert!(app.search.query.is_empty());
+        assert_eq!(app.cur_buf().lines[0], "alpha beta alpha");
+
+        // 2. Type query & search incrementally, then press Enter to find next while keeping focus
+        app.search.query = "alpha".to_string();
+        app.search.invalidate_cache();
+        app.search_incremental();
+        assert_eq!((app.cur_buf().cursor_line, app.cur_buf().cursor_col), (0, 0));
+        assert_eq!(app.search.matches().len(), 4);
+        assert_eq!(app.search.current_match, Some(0));
+
+        // Enter in focused find box jumps to 2nd match (0, 11)
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            (app.cur_buf().cursor_line, app.cur_buf().cursor_col),
+            (0, 11)
+        );
+        assert_eq!(app.search.current_match, Some(1));
+
+        // Ctrl+L while search bar is open jumps to 3rd match (1, 4)
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(
+            (app.cur_buf().cursor_line, app.cur_buf().cursor_col),
+            (1, 4)
+        );
+
+        // 3. ESC closes search bar and stays in Editor mode (NOT Filer!)
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.search.open);
+        assert!(!app.search.highlight_active);
+        assert_eq!(app.mode, AppMode::Editor);
+
+        // 4. Ctrl+L while search bar is CLOSED continues searching with last query & re-enables highlight!
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(
+            (app.cur_buf().cursor_line, app.cur_buf().cursor_col),
+            (2, 0)
+        );
+        assert!(app.search.highlight_active);
+
+        // Ctrl+Shift+L searches backward to (1, 4)
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            }],
+        );
+        assert_eq!(
+            (app.cur_buf().cursor_line, app.cur_buf().cursor_col),
+            (1, 4)
+        );
+
+        // 5. Ctrl+H opens Search & Replace bar; Ctrl+Q -> A also opens Replace bar
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::H,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+        );
+        assert!(app.search.open);
+        assert!(app.search.replace_mode);
+
+        // ESC closes replace bar, second ESC enters Filer
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.search.open);
+        assert_eq!(app.mode, AppMode::Editor);
+
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.mode, AppMode::Filer);
+
+        // Ctrl+F / Ctrl+Q+A from editor
+        app.enter_editor();
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::Q,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+        );
+        run_frame(
+            &mut app,
+            vec![Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.search.open);
+        assert!(app.search.replace_mode);
+    }
+
+    #[test]
+    fn test_replace_one_by_one_and_replace_all_with_undo() {
+        let mut app = make_test_app();
+        app.cur_buf_mut().lines = vec![
+            "foo bar foo".to_string(),
+            "日本語fooテスト foo".to_string(),
+        ];
+        app.cur_buf_mut().revision += 1;
+        app.cur_buf_mut().set_cursor(0, 0);
+
+        // Self-overlapping replacement: "foo" -> "foobar"
+        app.open_search_bar(true);
+        app.search.query = "foo".to_string();
+        app.search.replacement = "foobar".to_string();
+        app.search.invalidate_cache();
+        app.search_incremental();
+        assert_eq!((app.cur_buf().cursor_line, app.cur_buf().cursor_col), (0, 0));
+
+        // 1st replace: replaces (0, 0..3) and advances to (0, 11) — does NOT loop on "foobar"!
+        app.replace_current_and_next();
+        assert_eq!(app.cur_buf().lines[0], "foobar bar foo");
+        assert_eq!(
+            (app.cur_buf().cursor_line, app.cur_buf().cursor_col),
+            (0, 11)
+        );
+
+        // 2nd replace: replaces (0, 11..14) and advances to line 1 col 3
+        app.replace_current_and_next();
+        assert_eq!(app.cur_buf().lines[0], "foobar bar foobar");
+        assert_eq!(
+            (app.cur_buf().cursor_line, app.cur_buf().cursor_col),
+            (1, 3)
+        );
+
+        // Now test Replace All on a fresh text with Japanese & Undo
+        app.cur_buf_mut().lines = vec![
+            "検索対象と検索対象".to_string(),
+            "もう一つ検索対象".to_string(),
+        ];
+        app.cur_buf_mut().revision += 1;
+        app.cur_buf_mut().set_cursor(0, 0);
+
+        app.search.query = "検索対象".to_string();
+        app.search.replacement = "置換済".to_string();
+        app.search.invalidate_cache();
+        app.replace_all();
+        assert_eq!(
+            app.cur_buf().lines,
+            vec!["置換済と置換済".to_string(), "もう一つ置換済".to_string()]
+        );
+
+        // Single undo reverts all 3 replacements
+        app.menu_undo();
+        assert_eq!(
+            app.cur_buf().lines,
+            vec![
+                "検索対象と検索対象".to_string(),
+                "もう一つ検索対象".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_headless_render_search_and_replace_bar_with_highlights() {
+        let mut app = make_test_app();
+        app.cur_buf_mut().lines = vec![
+            "\tVZ Editor 検索テスト VZ".to_string(),
+            "日本語と vz のハイライト表示テスト".to_string(),
+        ];
+        app.cur_buf_mut().revision += 1;
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 680.0))),
+            ..Default::default()
+        };
+
+        app.open_search_bar(false);
+        app.search.query = "vz".to_string();
+        app.search.invalidate_cache();
+        app.search_incremental();
+        assert_eq!(app.search.matches().len(), 3);
+
+        for &size in &[MIN_FONT_SIZE, DEFAULT_FONT_SIZE, MAX_FONT_SIZE] {
+            app.set_font_size(size);
+
+            // Render Search mode with highlights
+            app.search.replace_mode = false;
+            let _ = ctx.run(raw_input.clone(), |ctx| {
+                app.render_menu_bar(ctx);
+                app.render_status_bar(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_search_bar(ctx);
+                app.render_editor_canvas(ctx);
+            });
+
+            // Render Replace mode with highlights
+            app.search.replace_mode = true;
+            let _ = ctx.run(raw_input.clone(), |ctx| {
+                app.render_menu_bar(ctx);
+                app.render_status_bar(ctx);
+                app.render_fkey_bar(ctx);
+                app.render_search_bar(ctx);
+                app.render_editor_canvas(ctx);
+            });
+        }
+    }
 }
+
 
 

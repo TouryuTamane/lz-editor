@@ -536,6 +536,128 @@ impl TextBuffer {
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
     }
+
+    /// Replace a byte range within a single line (supports Undo).
+    /// Moves the cursor to the end of the inserted replacement and returns `(end_line, end_col)`.
+    pub fn replace_in_line(
+        &mut self,
+        line: usize,
+        start_byte: usize,
+        end_byte: usize,
+        replacement: &str,
+    ) -> (usize, usize) {
+        if line >= self.lines.len()
+            || start_byte > end_byte
+            || end_byte > self.lines[line].len()
+            || !self.lines[line].is_char_boundary(start_byte)
+            || !self.lines[line].is_char_boundary(end_byte)
+        {
+            return (self.cursor_line, self.cursor_col);
+        }
+
+        self.push_undo_snapshot();
+        self.preferred_visual_col = None;
+
+        let normalized = replacement.replace("\r\n", "\n").replace('\r', "\n");
+        let start_col = self.lines[line][..start_byte].chars().count();
+
+        if !normalized.contains('\n') {
+            self.lines[line].replace_range(start_byte..end_byte, &normalized);
+            self.cursor_line = line;
+            self.cursor_col = start_col + normalized.chars().count();
+        } else {
+            let prefix = self.lines[line][..start_byte].to_string();
+            let suffix = self.lines[line][end_byte..].to_string();
+            let mut parts: Vec<String> = normalized.split('\n').map(String::from).collect();
+            let last_part_chars = parts.last().map(|s| s.chars().count()).unwrap_or(0);
+            if let Some(first) = parts.first_mut() {
+                first.insert_str(0, &prefix);
+            }
+            if let Some(last) = parts.last_mut() {
+                last.push_str(&suffix);
+            }
+            let added_lines = parts.len().saturating_sub(1);
+            self.lines.splice(line..=line, parts);
+            self.cursor_line = line + added_lines;
+            self.cursor_col = last_part_chars;
+        }
+
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        (self.cursor_line, self.cursor_col)
+    }
+
+    /// Replace all non-overlapping `(line, start_byte, end_byte)` ranges (sorted in ascending order)
+    /// in a single atomic Undo step. Returns the number of replaced occurrences.
+    pub fn replace_all_matches(
+        &mut self,
+        matches: &[(usize, usize, usize)],
+        replacement: &str,
+    ) -> usize {
+        if matches.is_empty() {
+            return 0;
+        }
+
+        self.push_undo_snapshot();
+        self.preferred_visual_col = None;
+
+        let normalized = replacement.replace("\r\n", "\n").replace('\r', "\n");
+        let has_newline = normalized.contains('\n');
+        let mut new_lines: Vec<String> = Vec::with_capacity(self.lines.len());
+        let mut replaced_count = 0usize;
+        let mut mi = 0usize;
+
+        for (line_idx, orig_line) in self.lines.iter().enumerate() {
+            if mi >= matches.len() || matches[mi].0 != line_idx {
+                new_lines.push(orig_line.clone());
+                continue;
+            }
+
+            let mut rebuilt = String::with_capacity(orig_line.len());
+            let mut last_byte = 0usize;
+            while mi < matches.len() && matches[mi].0 == line_idx {
+                let (_, start_byte, end_byte) = matches[mi];
+                if start_byte >= last_byte
+                    && start_byte <= end_byte
+                    && end_byte <= orig_line.len()
+                    && orig_line.is_char_boundary(start_byte)
+                    && orig_line.is_char_boundary(end_byte)
+                {
+                    rebuilt.push_str(&orig_line[last_byte..start_byte]);
+                    rebuilt.push_str(&normalized);
+                    last_byte = end_byte;
+                    replaced_count += 1;
+                }
+                mi += 1;
+            }
+            rebuilt.push_str(&orig_line[last_byte..]);
+
+            if has_newline {
+                for seg in rebuilt.split('\n') {
+                    new_lines.push(seg.to_string());
+                }
+            } else {
+                new_lines.push(rebuilt);
+            }
+        }
+
+        if replaced_count == 0 {
+            self.undo_stack.pop();
+            return 0;
+        }
+
+        if new_lines.is_empty() {
+            new_lines.push(String::new());
+        }
+        self.lines = new_lines;
+        let max_line = self.lines.len().saturating_sub(1);
+        self.cursor_line = self.cursor_line.min(max_line);
+        let max_col = self.line_char_len(self.cursor_line);
+        self.cursor_col = self.cursor_col.min(max_col);
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        replaced_count
+    }
 }
 
 #[cfg(test)]
@@ -644,5 +766,37 @@ mod tests {
         buf.insert_text("!");
         assert!(!buf.can_redo());
         assert_eq!(buf.lines, vec!["hello!"]);
+    }
+
+    #[test]
+    fn test_replace_in_line_and_replace_all_with_undo() {
+        let mut buf = TextBuffer::new();
+        buf.insert_text("こんにちは世界\n世界は広い 世界");
+
+        // Replace single Japanese occurrence on line 0
+        let start = "こんにちは".len();
+        let end = start + "世界".len();
+        let (end_line, end_col) = buf.replace_in_line(0, start, end, "宇宙");
+        assert_eq!((end_line, end_col), (0, 7));
+        assert_eq!(buf.lines[0], "こんにちは宇宙");
+
+        // Undo reverts single replacement
+        assert!(buf.undo());
+        assert_eq!(buf.lines[0], "こんにちは世界");
+
+        // Replace all 3 occurrences in one atomic undo step
+        let s1 = "こんにちは".len();
+        let e1 = s1 + "世界".len();
+        let s2 = 0;
+        let e2 = "世界".len();
+        let s3 = "世界は広い ".len();
+        let e3 = s3 + "世界".len();
+        let count = buf.replace_all_matches(&[(0, s1, e1), (1, s2, e2), (1, s3, e3)], "地球");
+        assert_eq!(count, 3);
+        assert_eq!(buf.lines, vec!["こんにちは地球", "地球は広い 地球"]);
+
+        // Single undo reverts all 3 replacements atomically
+        assert!(buf.undo());
+        assert_eq!(buf.lines, vec!["こんにちは世界", "世界は広い 世界"]);
     }
 }

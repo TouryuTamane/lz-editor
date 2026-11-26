@@ -1,6 +1,6 @@
 [package]
 name = "lz-editor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "LZ Editor - A lightweight native GUI VZ Editor clone for Linux written in Rust"
 license = "MIT"
@@ -17,6 +17,12 @@ path = "src/main.rs"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 unicode-width = "0.2"
+
+# Enable winit's Adwaita CSD decorator (with font rendering) on Linux Wayland compositors
+# such as GNOME/Mutter that do not provide server-side decorations; without this, winit
+# falls back to a blank titlebar with no title text.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita", "wayland-dlopen"] }
 
 [profile.release]
 opt-level = "s"
