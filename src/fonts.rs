@@ -3,9 +3,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-struct FontCandidate {
-    path: String,
-    index: u32,
+pub(crate) struct FontCandidate {
+    pub(crate) path: String,
+    pub(crate) index: u32,
 }
 
 /// Query fontconfig via `fc-match` to get the exact file path and TTC face index.
@@ -27,12 +27,7 @@ fn query_fc_match(pattern: &str) -> Option<FontCandidate> {
     Some(FontCandidate { path, index })
 }
 
-/// Load a system Japanese monospace font into egui's font definitions to prevent tofu (missing glyphs).
-pub fn configure_japanese_fonts(ctx: &egui::Context) -> Option<String> {
-    let mut fonts = FontDefinitions::default();
-    let mut loaded_names: Vec<String> = Vec::new();
-    let mut seen_keys: Vec<(String, u32)> = Vec::new();
-
+pub(crate) fn japanese_font_candidates() -> Vec<FontCandidate> {
     // Priority 1: Query fontconfig for Japanese monospace fonts (works on Ubuntu, Debian, Raspberry Pi OS).
     // Prefer TrueType Japanese monospace fonts and Noto Sans Mono CJK JP.
     let fc_patterns = [
@@ -92,9 +87,17 @@ pub fn configure_japanese_fonts(ctx: &egui::Context) -> Option<String> {
         }
     }
 
+    candidates
+}
+
+/// Load a system Japanese monospace font into egui's font definitions to prevent tofu (missing glyphs).
+pub fn configure_japanese_fonts(ctx: &egui::Context) -> Option<String> {
+    let mut fonts = FontDefinitions::default();
+    let mut loaded_names: Vec<String> = Vec::new();
+    let mut seen_keys: Vec<(String, u32)> = Vec::new();
     let mut primary_loaded_path: Option<String> = None;
 
-    for (i, cand) in candidates.into_iter().enumerate() {
+    for (i, cand) in japanese_font_candidates().into_iter().enumerate() {
         let key = (cand.path.clone(), cand.index);
         if seen_keys.contains(&key) {
             continue;
