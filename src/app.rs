@@ -6,6 +6,9 @@ use crate::filer::{
 };
 use crate::fonts::configure_japanese_fonts;
 use crate::markdown::{parse_markdown, render_markdown_view, MdBlock};
+use crate::print::{
+    self, Orientation, PageSetup, PrintDoc, TooLarge, MAX_FONT_PT, MIN_FONT_PT,
+};
 use crate::search::{FindOutcome, SearchFocus, SearchState};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Event, FontId, ImeEvent, Key, Pos2, Rect, Sense, Stroke,
@@ -179,6 +182,7 @@ enum MenuAction {
     OpenFile,
     SaveFile,
     SaveAs,
+    Print,
     CloseBuffer,
     ToggleFiler,
     Quit,
@@ -251,6 +255,10 @@ enum FilerModal {
     ConfirmCloseBuffer {
         buf_idx: usize,
         name: String,
+    },
+    ConfirmPrint {
+        pages: Option<usize>,
+        just_opened: bool,
     },
     ConfirmQuit,
 }
@@ -328,6 +336,8 @@ pub struct LzEditorApp {
     inline_prompt: Option<InlinePathPrompt>,
     filer_modal: Option<FilerModal>,
     search: SearchState,
+    print_setup: PageSetup,
+    pending_print: Option<Receiver<Result<String, String>>>,
 }
 
 impl LzEditorApp {
@@ -395,6 +405,8 @@ impl LzEditorApp {
             pending_dialog: None,
             inline_prompt: None,
             filer_modal: None,
+            print_setup: PageSetup::default(),
+            pending_print: None,
             search: SearchState::new(),
         }
     }
@@ -1244,6 +1256,12 @@ impl LzEditorApp {
                     enabled: true,
                 },
                 MenuEntry::Item {
+                    label: "印刷...",
+                    shortcut: "",
+                    action: MenuAction::Print,
+                    enabled: in_editor && self.pending_print.is_none(),
+                },
+                MenuEntry::Item {
                     label: "現在のバッファを閉じる",
                     shortcut: "",
                     action: MenuAction::CloseBuffer,
@@ -1445,6 +1463,7 @@ impl LzEditorApp {
             MenuAction::OpenFile => self.trigger_open(),
             MenuAction::SaveFile => self.trigger_save(),
             MenuAction::SaveAs => self.trigger_save_as(),
+            MenuAction::Print => self.open_print_dialog(),
             MenuAction::CloseBuffer => self.close_current_buffer(),
             MenuAction::ToggleFiler => match self.mode {
                 AppMode::Editor => self.enter_filer(),
@@ -4969,6 +4988,103 @@ impl LzEditorApp {
         self.show_about = open && !close_clicked;
     }
 
+    fn layout_for_print(&self) -> Result<PrintDoc, TooLarge> {
+        let buffer = self.cur_buf();
+        print::layout(
+            &buffer.lines,
+            self.print_setup,
+            &buffer.display_name(),
+            &print::printed_at_now(),
+        )
+    }
+
+    fn open_print_dialog(&mut self) {
+        let Ok(doc) = self.layout_for_print() else {
+            self.status_message = "ファイルが大きすぎます".into();
+            return;
+        };
+        self.filer_modal = Some(FilerModal::ConfirmPrint {
+            pages: Some(doc.pages.len()),
+            just_opened: true,
+        });
+    }
+
+    fn render_print_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &mut Option<usize>,
+        just_opened: bool,
+    ) -> bool {
+        let mut start = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("print_dialog")).show(ctx, |ui| {
+            ui.heading("印刷");
+            ui.label("CUPS の既定のプリンターに送信します");
+            let previous = self.print_setup;
+            ui.horizontal(|ui| {
+                for orientation in [Orientation::Portrait, Orientation::Landscape] {
+                    ui.radio_value(
+                        &mut self.print_setup.orientation,
+                        orientation,
+                        orientation.label(),
+                    );
+                }
+            });
+            ui.add(
+                egui::Slider::new(&mut self.print_setup.font_pt, MIN_FONT_PT..=MAX_FONT_PT)
+                    .text("文字サイズ (pt)"),
+            );
+            ui.checkbox(&mut self.print_setup.page_numbers, "ページ番号を印字する");
+            if self.print_setup != previous {
+                *pages = self.layout_for_print().ok().map(|doc| doc.pages.len());
+            }
+            match pages {
+                Some(count) => ui.label(format!("{count} ページ")),
+                None => ui.label("ファイルが大きすぎます"),
+            };
+            ui.horizontal(|ui| {
+                start = ui.add_enabled(pages.is_some(), egui::Button::new("印刷")).clicked();
+                cancel = ui.button("キャンセル").clicked()
+                    || (!just_opened && ui.input(|i| i.key_pressed(Key::Escape)));
+            });
+        });
+
+        if cancel {
+            return false;
+        }
+        if start {
+            match self.layout_for_print() {
+                Ok(doc) => {
+                    self.status_message = format!("印刷中... ({} ページ)", doc.pages.len());
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(print::submit(&doc));
+                        ctx.request_repaint();
+                    });
+                    self.pending_print = Some(rx);
+                }
+                Err(TooLarge) => self.status_message = "ファイルが大きすぎます".into(),
+            }
+            return false;
+        }
+        true
+    }
+
+    fn poll_print(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(receiver) = &self.pending_print else {
+            return;
+        };
+        self.status_message = match receiver.try_recv() {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => format!("印刷エラー: {error}"),
+            Err(TryRecvError::Disconnected) => "印刷エラー: 印刷処理が中断されました".into(),
+            Err(TryRecvError::Empty) => return,
+        };
+        self.pending_print = None;
+    }
+
     fn render_filer_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.filer_modal.take() else {
             return;
@@ -5403,6 +5519,10 @@ impl LzEditorApp {
                 }
             }
 
+            FilerModal::ConfirmPrint { pages, just_opened } => {
+                keep_modal = self.render_print_dialog(ctx, pages, *just_opened);
+                *just_opened = false;
+            }
             FilerModal::ConfirmQuit => {
                 let mut do_quit = false;
                 let mut do_cancel = false;
@@ -5592,6 +5712,7 @@ fn truncate_display_right(s: &str, max_cols: usize) -> String {
 impl eframe::App for LzEditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_dialog();
+        self.poll_print();
         self.handle_events(ctx);
 
         self.render_menu_bar(ctx);
@@ -5656,8 +5777,42 @@ mod tests {
             pending_dialog: None,
             inline_prompt: None,
             filer_modal: None,
+            print_setup: PageSetup::default(),
+            pending_print: None,
             search: SearchState::new(),
         }
+    }
+
+    #[test]
+    fn test_print_uses_current_buffer_and_is_only_available_in_editor() {
+        let mut app = make_test_app();
+        let action_enabled = |app: &LzEditorApp| {
+            app.build_menu_entries(TopMenu::File).iter().any(|entry| {
+                matches!(
+                    entry,
+                    MenuEntry::Item {
+                        action: MenuAction::Print,
+                        enabled: true,
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(action_enabled(&app));
+        let doc = app.layout_for_print().unwrap();
+        assert_eq!(doc.title, "notes.md");
+        assert_eq!(doc.pages[0][0].text, "# Title");
+
+        app.open_print_dialog();
+        assert!(matches!(
+            app.filer_modal,
+            Some(FilerModal::ConfirmPrint {
+                pages: Some(1),
+                ..
+            })
+        ));
+        app.mode = AppMode::Filer;
+        assert!(!action_enabled(&app));
     }
 
     #[test]

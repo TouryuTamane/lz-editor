@@ -64,6 +64,16 @@ There are already excellent terminal-based (TUI) VZ Editor clones for Linux, suc
 
 ---
 
+## Printing / 印刷
+
+Choose **File → Print…** (ファイル → 印刷...) to print the active buffer, including unsaved changes.
+The dialog shows the page count and lets you select A4 portrait or landscape, body font size (8–14 pt), and page numbers.
+Printing uses the CUPS default printer and requires `lp` (`cups-client` on Debian/Ubuntu) and a Japanese font such as Noto CJK.
+
+**ファイル → 印刷...** で未保存の変更を含む編集中のバッファを印刷します。Markdown はソースを印刷します。
+確認画面ではページ数を確認し、A4 の縦横・文字サイズ（8〜14 pt）・ページ番号の有無を選べます。
+印刷には CUPS の既定のプリンター、`lp`（Debian/Ubuntu では `cups-client`）、日本語フォントが必要です。
+
 ## Keybindings / キーバインド
 
 ### Editor Mode / エディタ画面

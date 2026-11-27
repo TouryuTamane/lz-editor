@@ -17,6 +17,9 @@ path = "src/main.rs"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 unicode-width = "0.2"
+krilla = { version = "0.8.2", default-features = false }
+skrifa = "0.42"
+tempfile = "3"
 
 # Enable winit's Adwaita CSD decorator (with font rendering) on Linux Wayland compositors
 # such as GNOME/Mutter that do not provide server-side decorations; without this, winit

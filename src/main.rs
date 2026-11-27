@@ -5,6 +5,7 @@ mod filer;
 mod fonts;
 mod icon;
 mod markdown;
+mod print;
 mod search;
 
 use app::LzEditorApp;
